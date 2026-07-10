@@ -25,14 +25,16 @@ interface CarGateway {
 class TcpCarGateway : CarGateway {
     private var socket: Socket? = null
 
-    override suspend fun connect(endpoint: Endpoint): TransportResult = try {
+    override suspend fun connect(endpoint: Endpoint): TransportResult {
         disconnect()
         val port = endpoint.port.toIntOrNull() ?: return TransportResult(false, "TCP 端口必须是数字")
-        socket = Socket().apply { connect(InetSocketAddress(endpoint.host.trim(), port), CONNECT_TIMEOUT_MS) }
-        TransportResult(true, "已连接课程 TCP ${endpoint.host}:$port")
-    } catch (error: Exception) {
-        disconnect()
-        TransportResult(false, "TCP 连接失败：${error.message ?: "未知错误"}")
+        return try {
+            socket = Socket().apply { connect(InetSocketAddress(endpoint.host.trim(), port), CONNECT_TIMEOUT_MS) }
+            TransportResult(true, "已连接课程 TCP ${endpoint.host}:$port")
+        } catch (error: Exception) {
+            disconnect()
+            TransportResult(false, "TCP 连接失败：${error.message ?: "未知错误"}")
+        }
     }
 
     override suspend fun button(direction: DriveDirection) = send(CarProtocol.button(direction), direction.label)
@@ -53,16 +55,18 @@ class TcpCarGateway : CarGateway {
         socket = null
     }
 
-    private fun send(frame: String, label: String): TransportResult = try {
+    private fun send(frame: String, label: String): TransportResult {
         val activeSocket = socket ?: return TransportResult(false, "尚未连接课程 TCP")
         if (!activeSocket.isConnected || activeSocket.isClosed) return TransportResult(false, "课程 TCP 已断开")
-        activeSocket.getOutputStream().apply {
-            write(frame.toByteArray(Charsets.US_ASCII))
-            flush()
+        return try {
+            activeSocket.getOutputStream().apply {
+                write(frame.toByteArray(Charsets.US_ASCII))
+                flush()
+            }
+            TransportResult(true, label, frame)
+        } catch (error: Exception) {
+            TransportResult(false, "发送失败：${error.message ?: "未知错误"}", frame)
         }
-        TransportResult(true, label, frame)
-    } catch (error: Exception) {
-        TransportResult(false, "发送失败：${error.message ?: "未知错误"}", frame)
     }
 
     private companion object { const val CONNECT_TIMEOUT_MS = 3_000 }

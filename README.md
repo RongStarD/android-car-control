@@ -14,7 +14,7 @@
 
 1. 安装 Android Studio，首次启动时保留 Standard 安装选项。
 2. 在 SDK Manager 中确认已安装 Android 15 (API 35)、Android SDK Build-Tools、Android SDK Platform-Tools。
-3. 用 Android Studio 打开 `D:\大三下\xxq\Project\android-car-control`，不要打开它的 `app` 子目录。
+3. 用 Android Studio 打开 `D:\Junior\xxq\Project\android-car-control`，不要打开它的 `app` 子目录。
 4. 等待 Gradle Sync 完成；第一次同步需要联网下载依赖。
 5. 在 Device Manager 创建 API 35 模拟器，或连接已启用 USB 调试的安卓手机。
 6. 在顶部设备列表选择目标设备，点击 Run 运行 `app`。
@@ -62,7 +62,7 @@ testDebugUnitTest -> lintDebug -> assembleDebug
 先在电脑运行模拟 TCP 小车，并让它监听局域网地址：
 
 ```powershell
-cd D:\大三下\xxq\Project\web-car-control
+cd D:\Junior\xxq\Project\web-car-control
 $env:MOCK_HOST = "0.0.0.0"
 npm run mock
 ```
