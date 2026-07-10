@@ -12,22 +12,47 @@
 
 ## 打开与构建
 
-1. 安装 Android Studio，并在 SDK Manager 中安装 Android 15 (API 35) SDK Platform 与 Build-Tools。
-2. 用 Android Studio 打开本目录：`android-car-control`。
-3. 等待 Gradle Sync 完成，选择真机或模拟器后运行。
+1. 安装 Android Studio，首次启动时保留 Standard 安装选项。
+2. 在 SDK Manager 中确认已安装 Android 15 (API 35)、Android SDK Build-Tools、Android SDK Platform-Tools。
+3. 用 Android Studio 打开 `D:\大三下\xxq\Project\android-car-control`，不要打开它的 `app` 子目录。
+4. 等待 Gradle Sync 完成；第一次同步需要联网下载依赖。
+5. 在 Device Manager 创建 API 35 模拟器，或连接已启用 USB 调试的安卓手机。
+6. 在顶部设备列表选择目标设备，点击 Run 运行 `app`。
 
 命令行环境已配置 Android SDK 时，可以运行：
 
 ```powershell
 .\gradlew.bat test
+.\gradlew.bat lintDebug
 .\gradlew.bat assembleDebug
 ```
+
+Debug APK 生成位置：
+
+```text
+app\build\outputs\apk\debug\app-debug.apk
+```
+
+## 持续集成
+
+GitHub Actions 会在推送到 `main`、`agent/**` 分支、创建 Pull Request 或手动触发时执行：
+
+```text
+testDebugUnitTest -> lintDebug -> assembleDebug
+```
+
+使用方法：
+
+1. 打开 GitHub 仓库的 Actions 页面，选择 `Android CI`。
+2. 查看最近一次运行；绿色对勾表示测试、Lint 和编译全部通过。
+3. 需要手动运行时点击 `Run workflow`。
+4. 成功运行的详情页底部会提供 `android-debug-apk`，其中包含 Debug APK，保留 14 天。
 
 ## 连接模式
 
 | 模式 | 地址 | 用途 |
 | --- | --- | --- |
-| Jetson ROS | `10.39.132.165:8081` | 当前建议路径。先按项目根目录的 `scripts/start-m3-web-bridge.ps1` 启动临时 Bridge。 |
+| Jetson ROS | `10.39.132.165:8081` | 当前建议路径。先运行旧 Web 参考仓库中的 `scripts/start-m3-web-bridge.ps1` 启动临时 Bridge。 |
 | 课程 TCP | `小车 IP:6000` | 课程鸿蒙参考项目的原始协议。真车必须实际监听此端口。 |
 
 `Jetson ROS` 模式会调用小车端 Bridge 的 `/api/button`、`/api/joystick` 和 `/api/stop`，最终发布到 `/cmd_vel`。它复刻当前 `m3` 键盘控制的速度配置，不支持课程 TCP 的拍照、录像、循迹和独立轮速。
