@@ -2,6 +2,8 @@ name: Final Apps CD
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "*/30 * * * *"
   push:
     tags:
       - "v[0-9]*"
@@ -67,11 +69,11 @@ jobs:
           done
 
       - name: Build delivery-validation APK
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         run: ./gradlew testDebugUnitTest lintDebug assembleDebug --no-daemon --stacktrace
 
       - name: Prepare delivery-validation APK
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}"
           cp app/build/outputs/apk/debug/app-debug.apk \

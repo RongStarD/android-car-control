@@ -17,7 +17,7 @@ testDebugUnitTest -> lintDebug -> assembleDebug
 
 ## CD 验证
 
-在 Actions 页面手动运行 `Final Apps CD`，会重新测试并构建两个 Debug APK，随后打包为带 `SHA256SUMS.txt` 的 `final-apps-delivery` artifact。该模式无需发布密钥，可用于验证整条交付流水线。
+`Final Apps CD` 会在 Actions 页面手动运行时，以及每半小时定时运行一次（UTC 时间每小时的第 0、30 分钟）。它会基于 `main` 的最新代码重新测试并构建两个 Debug APK，随后打包为带 `SHA256SUMS.txt` 的 `final-apps-delivery` artifact。该模式无需发布密钥，可用于持续验证整条交付流水线。GitHub Actions 的定时任务可能因平台负载而延迟几分钟。
 
 ## 正式签名发布
 
