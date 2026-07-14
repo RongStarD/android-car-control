@@ -1,0 +1,1668 @@
+diff --git a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/FaceEnrollmentViewModel.kt b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/FaceEnrollmentViewModel.kt
+index c13fbdd..e9cd06f 100644
+--- a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/FaceEnrollmentViewModel.kt
++++ b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/FaceEnrollmentViewModel.kt
+@@ -5,11 +5,15 @@ import android.net.Uri
+ import androidx.lifecycle.AndroidViewModel
+ import androidx.lifecycle.viewModelScope
+ import cn.edu.xxq.faceenrollment.data.ApiResult
++import cn.edu.xxq.faceenrollment.data.CatalogProduct
+ import cn.edu.xxq.faceenrollment.data.DEFAULT_FACE_SERVICE_URL
+ import cn.edu.xxq.faceenrollment.data.FaceApiClient
+ import cn.edu.xxq.faceenrollment.data.FaceEndpoint
+ import cn.edu.xxq.faceenrollment.data.MAX_FACE_IMAGES
+ import cn.edu.xxq.faceenrollment.data.MAX_FACE_TOTAL_BYTES
++import cn.edu.xxq.faceenrollment.data.OrderItemRequest
++import cn.edu.xxq.faceenrollment.data.OrderReceipt
++import cn.edu.xxq.faceenrollment.data.RecognitionSession
+ import cn.edu.xxq.faceenrollment.data.ServiceStatus
+ import cn.edu.xxq.faceenrollment.media.FaceImageProcessor
+ import cn.edu.xxq.faceenrollment.media.FaceImageSample
+@@ -28,6 +32,9 @@ import kotlinx.coroutines.withContext
+ 
+ private const val PREFERENCES_NAME = "face_enrollment"
+ private const val AUTO_REFRESH_INTERVAL_MS = 5_000L
++private const val RECOGNITION_POLL_INTERVAL_MS = 500L
++private const val RECOGNITION_DURATION_SECONDS = 5
++private const val MAX_ORDER_QUANTITY = 99
+ 
+ data class FaceEnrollmentUiState(
+     val serviceUrl: String = DEFAULT_FACE_SERVICE_URL,
+@@ -40,9 +47,24 @@ data class FaceEnrollmentUiState(
+     val uploading: Boolean = false,
+     val statusLoading: Boolean = false,
+     val statusError: String? = null,
++    val recognitionSession: RecognitionSession? = null,
++    val recognitionRequestLoading: Boolean = false,
++    val recognitionError: String? = null,
+     val notice: String? = null,
+     val actionError: String? = null,
+     val statusUpdatedAt: Long? = null,
++    val orderPersonName: String = "",
++    val roomNumber: String = "",
++    val catalog: List<CatalogProduct> = emptyList(),
++    val productQuantities: Map<String, Int> = emptyMap(),
++    val catalogLoading: Boolean = false,
++    val catalogError: String? = null,
++    val catalogLoadedAt: Long? = null,
++    val orderSubmitting: Boolean = false,
++    val orderError: String? = null,
++    val lastOrder: OrderReceipt? = null,
++    val lastEnrolledPersonId: String? = null,
++    val lastEnrolledName: String? = null,
+ )
+ 
+ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(application) {
+@@ -50,15 +72,25 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+     private val apiClient = FaceApiClient()
+     private val imageProcessor = FaceImageProcessor(application.contentResolver)
+     private val statusMutex = Mutex()
++    private val recognitionMutex = Mutex()
++    private val catalogMutex = Mutex()
+     private var pollingJob: Job? = null
++    private var recognitionPollingJob: Job? = null
++    private var orderJob: Job? = null
+     private var pollingEnabledByLifecycle = false
+     private var configurationGeneration = 0L
+ 
+     private val _state = MutableStateFlow(
+-        FaceEnrollmentUiState(
+-            serviceUrl = preferences.getString("service_url", DEFAULT_FACE_SERVICE_URL)
+-                ?: DEFAULT_FACE_SERVICE_URL,
+-        ),
++        preferences.getString("last_enrolled_name", "").orEmpty().let { recentName ->
++            FaceEnrollmentUiState(
++                serviceUrl = preferences.getString("service_url", DEFAULT_FACE_SERVICE_URL)
++                    ?: DEFAULT_FACE_SERVICE_URL,
++                personName = recentName,
++                orderPersonName = recentName,
++                lastEnrolledPersonId = preferences.getString("last_enrolled_person_id", null),
++                lastEnrolledName = recentName.takeIf(String::isNotBlank),
++            )
++        },
+     )
+     val state: StateFlow<FaceEnrollmentUiState> = _state.asStateFlow()
+ 
+@@ -77,15 +109,147 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+                 statusError = null,
+                 actionError = null,
+                 statusLoading = false,
++                recognitionSession = null,
++                recognitionRequestLoading = false,
++                recognitionError = null,
++                catalog = emptyList(),
++                productQuantities = emptyMap(),
++                catalogLoading = false,
++                catalogError = null,
++                catalogLoadedAt = null,
++                orderSubmitting = false,
++                orderError = null,
++                lastOrder = null,
+             )
+         }
++        stopRecognitionPolling()
++        apiClient.cancelCatalogRequests()
++        apiClient.cancelOrderRequests()
++        orderJob?.cancel()
++        orderJob = null
+         preferences.edit().putString("service_url", value).apply()
+         restartPollingAfterConfigurationChange()
+     }
+ 
+     fun setPersonName(value: String) {
+         if (value.length <= 80 && '\n' !in value && '\r' !in value) {
+-            _state.update { it.copy(personName = value, actionError = null) }
++            _state.update {
++                it.copy(
++                    personName = value,
++                    orderPersonName = if (
++                        it.orderPersonName.isBlank() || it.orderPersonName == it.personName
++                    ) value else it.orderPersonName,
++                    actionError = null,
++                )
++            }
++        }
++    }
++
++    fun setOrderPersonName(value: String) {
++        if (value.length <= 80 && '\n' !in value && '\r' !in value) {
++            _state.update { it.copy(orderPersonName = value, orderError = null, lastOrder = null) }
++        }
++    }
++
++    fun setRoomNumber(value: String) {
++        if (value.length <= 64 && '\n' !in value && '\r' !in value) {
++            _state.update { it.copy(roomNumber = value, orderError = null, lastOrder = null) }
++        }
++    }
++
++    fun toggleProduct(productId: String) {
++        _state.update { state ->
++            val product = state.catalog.firstOrNull { it.productId == productId && it.enabled }
++                ?: return@update state
++            val updated = state.productQuantities.toMutableMap()
++            if ((updated[product.productId] ?: 0) > 0) {
++                updated.remove(product.productId)
++            } else {
++                updated[product.productId] = 1
++            }
++            state.copy(productQuantities = updated, orderError = null, lastOrder = null)
++        }
++    }
++
++    fun changeProductQuantity(productId: String, delta: Int) {
++        if (delta == 0) return
++        _state.update { state ->
++            val product = state.catalog.firstOrNull { it.productId == productId && it.enabled }
++                ?: return@update state
++            val current = state.productQuantities[product.productId] ?: 0
++            val next = (current + delta).coerceIn(0, MAX_ORDER_QUANTITY)
++            val updated = state.productQuantities.toMutableMap()
++            if (next == 0) updated.remove(product.productId) else updated[product.productId] = next
++            state.copy(productQuantities = updated, orderError = null, lastOrder = null)
++        }
++    }
++
++    fun refreshCatalog() {
++        if (!pollingEnabledByLifecycle || _state.value.catalogLoading) return
++        val normalizedUrl = FaceEndpoint.normalize(_state.value.serviceUrl)
++        if (normalizedUrl == null) {
++            _state.update { it.copy(catalogError = "服务地址无效，请填写 http:// 或 https:// 地址") }
++            return
++        }
++        viewModelScope.launch { loadCatalog(normalizedUrl) }
++    }
++
++    fun submitOrder() {
++        val snapshot = _state.value
++        if (snapshot.orderSubmitting) return
++        val normalizedUrl = FaceEndpoint.normalize(snapshot.serviceUrl)
++        val validationError = OrderFormLogic.validationError(
++            serviceUrl = normalizedUrl,
++            personName = snapshot.orderPersonName,
++            roomNumber = snapshot.roomNumber,
++            catalog = snapshot.catalog,
++            productQuantities = snapshot.productQuantities,
++            lastEnrolledPersonId = snapshot.lastEnrolledPersonId,
++            lastEnrolledName = snapshot.lastEnrolledName,
++        )
++        if (validationError != null) {
++            _state.update { it.copy(orderError = validationError, lastOrder = null) }
++            return
++        }
++        val url = checkNotNull(normalizedUrl)
++        val personId = checkNotNull(snapshot.lastEnrolledPersonId?.trim()?.takeIf(String::isNotEmpty))
++        val requestItems = OrderFormLogic.requestItems(snapshot.catalog, snapshot.productQuantities)
++        val generation = configurationGeneration
++        _state.update {
++            it.copy(
++                serviceUrl = url,
++                orderSubmitting = true,
++                orderError = null,
++                lastOrder = null,
++            )
++        }
++        preferences.edit().putString("service_url", url).apply()
++        orderJob = viewModelScope.launch {
++            val result = withContext(Dispatchers.IO) {
++                apiClient.createOrder(
++                    baseUrl = url,
++                    personId = personId,
++                    personName = snapshot.orderPersonName,
++                    roomNumber = snapshot.roomNumber,
++                    items = requestItems,
++                )
++            }
++            if (generation != configurationGeneration) return@launch
++            when (result) {
++                is ApiResult.Success -> _state.update {
++                    it.copy(
++                        orderSubmitting = false,
++                        roomNumber = "",
++                        productQuantities = emptyMap(),
++                        orderError = null,
++                        lastOrder = result.value,
++                    )
++                }
++                is ApiResult.Failure -> _state.update {
++                    it.copy(orderSubmitting = false, orderError = result.message, lastOrder = null)
++                }
++            }
++            orderJob = null
+         }
+     }
+ 
+@@ -100,7 +264,84 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+ 
+     fun setPollingEnabled(enabled: Boolean) {
+         pollingEnabledByLifecycle = enabled
+-        if (enabled && canPoll()) startPolling(immediate = true) else stopPolling()
++        if (enabled) {
++            if (canPoll()) startPolling(immediate = true) else stopPolling()
++            if (_state.value.recognitionSession?.active == true) ensureRecognitionPolling()
++            if (_state.value.catalog.isEmpty() && !_state.value.catalogLoading) refreshCatalog()
++        } else {
++            stopPolling()
++            stopRecognitionPolling()
++            apiClient.cancelCatalogRequests()
++            _state.update { it.copy(catalogLoading = false) }
++        }
++    }
++
++    fun startRecognition() {
++        val snapshot = _state.value
++        if (snapshot.recognitionRequestLoading || snapshot.recognitionSession?.active == true) return
++        val normalizedUrl = FaceEndpoint.normalize(snapshot.serviceUrl)
++        if (normalizedUrl == null) {
++            _state.update { it.copy(recognitionError = "服务地址无效，请填写 http:// 或 https:// 地址") }
++            return
++        }
++        _state.update {
++            it.copy(
++                serviceUrl = normalizedUrl,
++                recognitionRequestLoading = true,
++                recognitionError = null,
++                recognitionSession = null,
++            )
++        }
++        preferences.edit().putString("service_url", normalizedUrl).apply()
++        val generation = configurationGeneration
++        viewModelScope.launch {
++            val result = withContext(Dispatchers.IO) {
++                apiClient.startRecognitionSession(normalizedUrl, RECOGNITION_DURATION_SECONDS)
++            }
++            if (generation != configurationGeneration || !pollingEnabledByLifecycle) return@launch
++            when (result) {
++                is ApiResult.Success -> {
++                    _state.update {
++                        it.copy(
++                            recognitionRequestLoading = false,
++                            recognitionSession = result.value,
++                            recognitionError = null,
++                        )
++                    }
++                    if (result.value.active && pollingEnabledByLifecycle) ensureRecognitionPolling()
++                }
++                is ApiResult.Failure -> _state.update {
++                    it.copy(recognitionRequestLoading = false, recognitionError = result.message)
++                }
++            }
++        }
++    }
++
++    fun cancelRecognition() {
++        val snapshot = _state.value
++        if (snapshot.recognitionRequestLoading || snapshot.recognitionSession?.active != true) return
++        val normalizedUrl = FaceEndpoint.normalize(snapshot.serviceUrl) ?: return
++        _state.update { it.copy(recognitionRequestLoading = true, recognitionError = null) }
++        val generation = configurationGeneration
++        viewModelScope.launch {
++            val result = withContext(Dispatchers.IO) { apiClient.cancelRecognitionSession(normalizedUrl) }
++            if (generation != configurationGeneration || !pollingEnabledByLifecycle) return@launch
++            when (result) {
++                is ApiResult.Success -> {
++                    _state.update {
++                        it.copy(
++                            recognitionRequestLoading = false,
++                            recognitionSession = result.value,
++                            recognitionError = null,
++                        )
++                    }
++                    stopRecognitionPolling()
++                }
++                is ApiResult.Failure -> _state.update {
++                    it.copy(recognitionRequestLoading = false, recognitionError = result.message)
++                }
++            }
++        }
+     }
+ 
+     fun addImages(
+@@ -235,12 +476,24 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+                                 it.copy(
+                                     uploading = false,
+                                     images = emptyList(),
++                                    personName = receipt.name,
++                                    orderPersonName = receipt.name,
++                                    lastEnrolledPersonId = receipt.personId,
++                                    lastEnrolledName = receipt.name,
+                                     notice = receipt.message ?: receipt.totalSamples?.let { total ->
+                                         "${receipt.name} 录入成功，新增 ${receipt.acceptedSamples} 张，远端共 $total 张样本"
+                                     } ?: "${receipt.name} 录入成功，共 ${receipt.acceptedSamples} 张样本",
+                                     actionError = null,
+                                 )
+                             }
++                            preferences.edit().apply {
++                                putString("last_enrolled_name", receipt.name)
++                                if (receipt.personId != null) {
++                                    putString("last_enrolled_person_id", receipt.personId)
++                                } else {
++                                    remove("last_enrolled_person_id")
++                                }
++                            }.apply()
+                             refreshStatus()
+                         }
+                         is ApiResult.Failure -> _state.update {
+@@ -291,25 +544,94 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+                 apiClient.getStatus(snapshot.serviceUrl)
+             }
+             if (generation != configurationGeneration || !pollingEnabledByLifecycle) return
++            var activeSession = false
+             _state.update {
+                 when (result) {
+-                    is ApiResult.Success -> it.copy(
+-                        serviceStatus = result.value,
+-                        statusLoading = false,
+-                        statusError = null,
+-                        statusUpdatedAt = System.currentTimeMillis(),
+-                    )
++                    is ApiResult.Success -> {
++                        val session = result.value.recognitionSession
++                        activeSession = session?.active == true
++                        it.copy(
++                            serviceStatus = result.value,
++                            recognitionSession = session ?: it.recognitionSession,
++                            statusLoading = false,
++                            statusError = null,
++                            statusUpdatedAt = System.currentTimeMillis(),
++                        )
++                    }
+                     is ApiResult.Failure -> it.copy(
+                         statusLoading = false,
+                         statusError = result.message,
+                     )
+                 }
+             }
++            if (activeSession) ensureRecognitionPolling()
+         } finally {
+             statusMutex.unlock()
+         }
+     }
+ 
++    private suspend fun loadCatalog(normalizedUrl: String) {
++        if (!pollingEnabledByLifecycle || !catalogMutex.tryLock()) return
++        try {
++            val generation = configurationGeneration
++            _state.update { it.copy(catalogLoading = true, catalogError = null) }
++            val result = withContext(Dispatchers.IO) { apiClient.getCatalog(normalizedUrl) }
++            if (generation != configurationGeneration || !pollingEnabledByLifecycle) return
++            _state.update { state ->
++                when (result) {
++                    is ApiResult.Success -> {
++                        val availableIds = result.value.filter(CatalogProduct::enabled)
++                            .mapTo(mutableSetOf(), CatalogProduct::productId)
++                        state.copy(
++                            catalog = result.value,
++                            productQuantities = state.productQuantities.filterKeys(availableIds::contains),
++                            catalogLoading = false,
++                            catalogError = null,
++                            catalogLoadedAt = System.currentTimeMillis(),
++                        )
++                    }
++                    is ApiResult.Failure -> state.copy(
++                        catalogLoading = false,
++                        catalogError = result.message,
++                    )
++                }
++            }
++        } finally {
++            catalogMutex.unlock()
++        }
++    }
++
++    private fun ensureRecognitionPolling() {
++        if (!pollingEnabledByLifecycle || recognitionPollingJob?.isActive == true) return
++        recognitionPollingJob = viewModelScope.launch {
++            while (isActive && pollingEnabledByLifecycle && _state.value.recognitionSession?.active == true) {
++                loadRecognitionSession()
++                if (_state.value.recognitionSession?.active != true) break
++                delay(RECOGNITION_POLL_INTERVAL_MS)
++            }
++        }
++    }
++
++    private suspend fun loadRecognitionSession() {
++        if (!pollingEnabledByLifecycle || !recognitionMutex.tryLock()) return
++        try {
++            val snapshot = _state.value
++            val generation = configurationGeneration
++            val result = withContext(Dispatchers.IO) {
++                apiClient.getRecognitionSession(snapshot.serviceUrl)
++            }
++            if (generation != configurationGeneration || !pollingEnabledByLifecycle) return
++            when (result) {
++                is ApiResult.Success -> _state.update {
++                    it.copy(recognitionSession = result.value, recognitionError = null)
++                }
++                is ApiResult.Failure -> _state.update { it.copy(recognitionError = result.message) }
++            }
++        } finally {
++            recognitionMutex.unlock()
++        }
++    }
++
+     private fun showError(message: String) {
+         _state.update { it.copy(actionError = message, notice = null) }
+     }
+@@ -329,10 +651,62 @@ class FaceEnrollmentViewModel(application: Application) : AndroidViewModel(appli
+         _state.update { it.copy(statusLoading = false) }
+     }
+ 
++    private fun stopRecognitionPolling() {
++        recognitionPollingJob?.cancel()
++        recognitionPollingJob = null
++        apiClient.cancelRecognitionRequests()
++        _state.update { it.copy(recognitionRequestLoading = false) }
++    }
++
+     override fun onCleared() {
+         pollingJob?.cancel()
++        recognitionPollingJob?.cancel()
++        orderJob?.cancel()
+         apiClient.cancelStatusRequests()
++        apiClient.cancelRecognitionRequests()
++        apiClient.cancelCatalogRequests()
++        apiClient.cancelOrderRequests()
+         apiClient.close()
+         super.onCleared()
+     }
+ }
++
++internal object OrderFormLogic {
++    fun validationError(
++        serviceUrl: String?,
++        personName: String,
++        roomNumber: String,
++        catalog: List<CatalogProduct>,
++        productQuantities: Map<String, Int>,
++        lastEnrolledPersonId: String?,
++        lastEnrolledName: String?,
++    ): String? {
++        val cleanName = personName.trim()
++        val cleanRoom = roomNumber.trim()
++        val enrolledName = lastEnrolledName?.trim().orEmpty()
++        return when {
++            serviceUrl == null -> "服务地址无效，请填写 http:// 或 https:// 地址"
++            cleanName.isEmpty() -> "请输入已录入人脸的姓名"
++            cleanName.length > 64 -> "姓名不能超过 64 个字符"
++            lastEnrolledPersonId.isNullOrBlank() || enrolledName.isEmpty() || cleanName != enrolledName ->
++                "请先使用“$cleanName”在人脸采集页面完成人脸录入"
++            cleanRoom.isEmpty() -> "请输入房间号"
++            cleanRoom.length > 32 -> "房间号不能超过 32 个字符"
++            catalog.none(CatalogProduct::enabled) -> "当前没有可下单商品，请刷新商品列表"
++            requestItems(catalog, productQuantities).isEmpty() -> "请至少选择一件商品"
++            else -> null
++        }
++    }
++
++    fun requestItems(
++        catalog: List<CatalogProduct>,
++        productQuantities: Map<String, Int>,
++    ): List<OrderItemRequest> = catalog.asSequence()
++        .filter(CatalogProduct::enabled)
++        .mapNotNull { product ->
++            val quantity = productQuantities[product.productId] ?: return@mapNotNull null
++            if (quantity !in 1..MAX_ORDER_QUANTITY) return@mapNotNull null
++            OrderItemRequest(product.productId, quantity)
++        }
++        .toList()
++}
+diff --git a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/MainActivity.kt b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/MainActivity.kt
+index f1794d2..553b1a2 100644
+--- a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/MainActivity.kt
++++ b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/MainActivity.kt
+@@ -1,10 +1,10 @@
+ package cn.edu.xxq.faceenrollment
+ 
+ import android.content.Context
++import android.graphics.Bitmap
+ import android.graphics.BitmapFactory
+ import android.net.Uri
+ import android.os.Bundle
+-import android.view.WindowManager
+ import androidx.activity.ComponentActivity
+ import androidx.activity.compose.rememberLauncherForActivityResult
+ import androidx.activity.compose.setContent
+@@ -16,6 +16,7 @@ import androidx.compose.foundation.Image
+ import androidx.compose.foundation.background
+ import androidx.compose.foundation.horizontalScroll
+ import androidx.compose.foundation.layout.Arrangement
++import androidx.compose.foundation.layout.aspectRatio
+ import androidx.compose.foundation.layout.Box
+ import androidx.compose.foundation.layout.Column
+ import androidx.compose.foundation.layout.ColumnScope
+@@ -37,6 +38,7 @@ import androidx.compose.foundation.verticalScroll
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.Card
+ import androidx.compose.material3.CardDefaults
++import androidx.compose.material3.Checkbox
+ import androidx.compose.material3.CircularProgressIndicator
+ import androidx.compose.material3.HorizontalDivider
+ import androidx.compose.material3.LinearProgressIndicator
+@@ -53,6 +55,7 @@ import androidx.compose.runtime.Composable
+ import androidx.compose.runtime.DisposableEffect
+ import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.key
++import androidx.compose.runtime.mutableIntStateOf
+ import androidx.compose.runtime.mutableStateOf
+ import androidx.compose.runtime.remember
+ import androidx.compose.runtime.saveable.rememberSaveable
+@@ -76,8 +79,13 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
+ import androidx.lifecycle.viewmodel.compose.viewModel
+ import cn.edu.xxq.faceenrollment.data.MAX_FACE_IMAGES
+ import cn.edu.xxq.faceenrollment.data.MAX_FACE_TOTAL_BYTES
++import cn.edu.xxq.faceenrollment.data.OrderReceipt
++import cn.edu.xxq.faceenrollment.data.FaceEndpoint
++import cn.edu.xxq.faceenrollment.data.RecognitionSession
+ import cn.edu.xxq.faceenrollment.data.ServiceStatus
+ import cn.edu.xxq.faceenrollment.media.FaceImageSample
++import cn.edu.xxq.faceenrollment.network.MjpegStreamClient
++import cn.edu.xxq.faceenrollment.network.MjpegStreamListener
+ import java.io.File
+ import java.text.DateFormat
+ import java.util.Date
+@@ -102,7 +110,6 @@ private val AppColors = lightColorScheme(
+ class MainActivity : ComponentActivity() {
+     override fun onCreate(savedInstanceState: Bundle?) {
+         super.onCreate(savedInstanceState)
+-        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+         cleanupStaleCaptureFiles(this)
+         enableEdgeToEdge()
+         setContent {
+@@ -120,6 +127,7 @@ private fun FaceEnrollmentScreen(viewModel: FaceEnrollmentViewModel = viewModel(
+     val lifecycleOwner = LocalLifecycleOwner.current
+     var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
+     var pendingCameraPath by rememberSaveable { mutableStateOf<String?>(null) }
++    var selectedPage by rememberSaveable { mutableIntStateOf(0) }
+ 
+     DisposableEffect(lifecycleOwner, viewModel) {
+         val observer = LifecycleEventObserver { _, event ->
+@@ -167,41 +175,485 @@ private fun FaceEnrollmentScreen(viewModel: FaceEnrollmentViewModel = viewModel(
+                 .padding(horizontal = 16.dp, vertical = 12.dp),
+             verticalArrangement = Arrangement.spacedBy(12.dp),
+         ) {
+-            Header(state)
+-            state.notice?.let { MessageBanner(it, isError = false, viewModel::clearMessages) }
+-            state.actionError?.let { MessageBanner(it, isError = true, viewModel::clearMessages) }
+-            ServiceCard(state, viewModel)
+-            StatusCard(state, viewModel)
+-            EnrollmentCard(
+-                state = state,
+-                viewModel = viewModel,
+-                onTakePhoto = {
+-                    var target: CameraCaptureTarget? = null
+-                    try {
+-                        target = createCameraTarget(context)
+-                        pendingCameraUri = target.uri.toString()
+-                        pendingCameraPath = target.file.absolutePath
+-                        cameraLauncher.launch(target.uri)
+-                    } catch (error: Exception) {
+-                        deleteCaptureFile(target?.file?.absolutePath)
+-                        pendingCameraUri = null
+-                        pendingCameraPath = null
+-                        viewModel.reportActionError("无法启动系统相机：${error.message ?: "设备不可用"}")
++            Header(state, selectedPage)
++            PageSelector(selectedPage) { selectedPage = it }
++            if (selectedPage == 0) {
++                state.notice?.let { MessageBanner(it, isError = false, viewModel::clearMessages) }
++                state.actionError?.let { MessageBanner(it, isError = true, viewModel::clearMessages) }
++                ServiceCard(state, viewModel)
++                StatusCard(state, viewModel)
++                VideoRecognitionCard(state, viewModel)
++                EnrollmentCard(
++                    state = state,
++                    viewModel = viewModel,
++                    onTakePhoto = {
++                        var target: CameraCaptureTarget? = null
++                        try {
++                            target = createCameraTarget(context)
++                            pendingCameraUri = target.uri.toString()
++                            pendingCameraPath = target.file.absolutePath
++                            cameraLauncher.launch(target.uri)
++                        } catch (error: Exception) {
++                            deleteCaptureFile(target?.file?.absolutePath)
++                            pendingCameraUri = null
++                            pendingCameraPath = null
++                            viewModel.reportActionError("无法启动系统相机：${error.message ?: "设备不可用"}")
++                        }
++                    },
++                    onPickPhotos = {
++                        galleryLauncher.launch(
++                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
++                        )
++                    },
++                )
++            } else {
++                OrderPage(state, viewModel)
++            }
++            Spacer(Modifier.height(12.dp))
++        }
++    }
++}
++
++@Composable
++private fun PageSelector(selectedPage: Int, onSelect: (Int) -> Unit) {
++    Surface(
++        modifier = Modifier.fillMaxWidth(),
++        color = Color.White,
++        shape = RoundedCornerShape(16.dp),
++        border = BorderStroke(1.dp, Color(0xFFE0E7F0)),
++    ) {
++        Row(
++            modifier = Modifier.fillMaxWidth().padding(6.dp),
++            horizontalArrangement = Arrangement.spacedBy(8.dp),
++        ) {
++            if (selectedPage == 0) {
++                Button(onClick = { onSelect(0) }, modifier = Modifier.weight(1f)) { Text("人脸采集") }
++            } else {
++                OutlinedButton(onClick = { onSelect(0) }, modifier = Modifier.weight(1f)) { Text("人脸采集") }
++            }
++            if (selectedPage == 1) {
++                Button(onClick = { onSelect(1) }, modifier = Modifier.weight(1f)) { Text("商品下单") }
++            } else {
++                OutlinedButton(onClick = { onSelect(1) }, modifier = Modifier.weight(1f)) { Text("商品下单") }
++            }
++        }
++    }
++}
++
++@Composable
++private fun OrderPage(state: FaceEnrollmentUiState, viewModel: FaceEnrollmentViewModel) {
++    val enabledProducts = state.catalog.filter { it.enabled }
++    val selectedCount = state.productQuantities.values.sum()
++    val identityLinked = state.lastEnrolledPersonId?.isNotBlank() == true &&
++        state.orderPersonName.trim() == state.lastEnrolledName?.trim()
++
++    SectionCard("下单服务") {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Column(modifier = Modifier.weight(1f)) {
++                Text("Jetson 订单服务", fontWeight = FontWeight.SemiBold)
++                Text(
++                    state.serviceUrl,
++                    style = MaterialTheme.typography.bodySmall,
++                    color = Color(0xFF64748B),
++                    maxLines = 1,
++                    overflow = TextOverflow.Ellipsis,
++                )
++            }
++            StatusBadge(
++                if (state.serviceStatus != null && state.statusError == null) "在线" else "待连接",
++                if (state.serviceStatus != null && state.statusError == null) AppGreen else AppOrange,
++            )
++        }
++        Text(
++            "订单会同时绑定最近录入的人脸身份和姓名。此页面只显示本次订单，不会展示人员库或其他用户的订单。",
++            style = MaterialTheme.typography.bodySmall,
++            color = Color(0xFF64748B),
++        )
++    }
++
++    state.lastOrder?.let { OrderSuccessCard(it) }
++
++    SectionCard("收货信息") {
++        OutlinedTextField(
++            value = state.orderPersonName,
++            onValueChange = viewModel::setOrderPersonName,
++            modifier = Modifier.fillMaxWidth(),
++            label = { Text("姓名") },
++            supportingText = {
++                Text(
++                    when {
++                        state.orderPersonName.isBlank() -> "请填写已录入人脸时使用的姓名"
++                        identityLinked -> "已关联最近成功录入的人脸"
++                        else -> "修改姓名后，需要先用该姓名完成人脸录入"
++                    },
++                    color = if (identityLinked) AppGreen else Color(0xFF64748B),
++                )
++            },
++            singleLine = true,
++            enabled = !state.orderSubmitting,
++        )
++        OutlinedTextField(
++            value = state.roomNumber,
++            onValueChange = viewModel::setRoomNumber,
++            modifier = Modifier.fillMaxWidth(),
++            label = { Text("房间号") },
++            placeholder = { Text("例如：A302") },
++            supportingText = { Text("请填写小车能够到达的准确房间号") },
++            singleLine = true,
++            enabled = !state.orderSubmitting,
++            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
++        )
++    }
++
++    SectionCard("选择商品") {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            verticalAlignment = Alignment.CenterVertically,
++            horizontalArrangement = Arrangement.SpaceBetween,
++        ) {
++            Column(modifier = Modifier.weight(1f)) {
++                Text("可选商品 ${enabledProducts.size} 种", fontWeight = FontWeight.SemiBold)
++                state.catalogLoadedAt?.let { timestamp ->
++                    val time = remember(timestamp) {
++                        DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(timestamp))
+                     }
+-                },
+-                onPickPhotos = {
+-                    galleryLauncher.launch(
+-                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
++                    Text("列表更新于 $time", style = MaterialTheme.typography.labelSmall, color = Color(0xFF718096))
++                }
++            }
++            OutlinedButton(
++                onClick = viewModel::refreshCatalog,
++                enabled = !state.catalogLoading && !state.orderSubmitting,
++            ) { Text("刷新商品") }
++        }
++
++        if (state.catalogLoading) {
++            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
++            Text("正在读取商品列表…", color = Color(0xFF64748B))
++        }
++        state.catalogError?.let { ErrorText(it) }
++
++        when {
++            enabledProducts.isNotEmpty() -> enabledProducts.forEach { product ->
++                val quantity = state.productQuantities[product.productId] ?: 0
++                Surface(
++                    modifier = Modifier.fillMaxWidth(),
++                    color = if (quantity > 0) AppBlue.copy(alpha = 0.08f) else Color(0xFFF7F9FC),
++                    shape = RoundedCornerShape(12.dp),
++                    border = BorderStroke(
++                        1.dp,
++                        if (quantity > 0) AppBlue.copy(alpha = 0.35f) else Color(0xFFE4EAF1),
++                    ),
++                ) {
++                    Row(
++                        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 8.dp),
++                        verticalAlignment = Alignment.CenterVertically,
++                    ) {
++                        Checkbox(
++                            checked = quantity > 0,
++                            onCheckedChange = { viewModel.toggleProduct(product.productId) },
++                            enabled = !state.orderSubmitting,
++                        )
++                        Text(
++                            product.name,
++                            modifier = Modifier.weight(1f),
++                            fontWeight = if (quantity > 0) FontWeight.SemiBold else FontWeight.Normal,
++                            color = Color(0xFF26384C),
++                        )
++                        if (quantity > 0) {
++                            TextButton(
++                                onClick = { viewModel.changeProductQuantity(product.productId, -1) },
++                                enabled = !state.orderSubmitting,
++                            ) { Text("−", fontSize = 22.sp) }
++                            Surface(color = Color.White, shape = RoundedCornerShape(8.dp)) {
++                                Text(
++                                    quantity.toString(),
++                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
++                                    fontWeight = FontWeight.Bold,
++                                )
++                            }
++                            TextButton(
++                                onClick = { viewModel.changeProductQuantity(product.productId, 1) },
++                                enabled = !state.orderSubmitting && quantity < 99,
++                            ) { Text("+", fontSize = 20.sp) }
++                        }
++                    }
++                }
++            }
++            !state.catalogLoading && state.catalogError == null -> Surface(
++                color = Color(0xFFF7F9FC),
++                shape = RoundedCornerShape(12.dp),
++            ) {
++                Text(
++                    "当前没有可下单商品，请稍后刷新。",
++                    modifier = Modifier.fillMaxWidth().padding(14.dp),
++                    color = Color(0xFF64748B),
++                )
++            }
++        }
++
++        HorizontalDivider(color = Color(0xFFE3EAF2))
++        Text(
++            if (selectedCount > 0) "已选择 $selectedCount 件商品" else "尚未选择商品",
++            fontWeight = FontWeight.SemiBold,
++            color = if (selectedCount > 0) AppBlueDark else Color(0xFF64748B),
++        )
++        state.orderError?.let { ErrorText(it) }
++        Button(
++            onClick = viewModel::submitOrder,
++            modifier = Modifier.fillMaxWidth(),
++            enabled = !state.orderSubmitting && enabledProducts.isNotEmpty(),
++            contentPadding = PaddingValues(vertical = 13.dp),
++        ) {
++            if (state.orderSubmitting) {
++                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color.White)
++                Spacer(Modifier.width(9.dp))
++                Text("正在提交订单…")
++            } else {
++                Text("提交订单")
++            }
++        }
++    }
++}
++
++@Composable
++private fun OrderSuccessCard(order: OrderReceipt) {
++    val statusLabel = when (order.status) {
++        "pending" -> "待完成"
++        "delivering" -> "配送中"
++        "completed" -> "已完成"
++        "cancelled" -> "已取消"
++        else -> order.status
++    }
++    val statusColor = when (order.status) {
++        "completed" -> AppGreen
++        "cancelled" -> AppRed
++        else -> AppOrange
++    }
++    SectionCard("下单成功") {
++        Row(
++            modifier = Modifier.fillMaxWidth(),
++            horizontalArrangement = Arrangement.SpaceBetween,
++            verticalAlignment = Alignment.CenterVertically,
++        ) {
++            Column(modifier = Modifier.weight(1f)) {
++                Text("订单已提交", color = AppGreen, fontWeight = FontWeight.Bold, fontSize = 18.sp)
++                Text("请等待管理端安排小车配送", color = Color(0xFF64748B))
++            }
++            StatusBadge(statusLabel, statusColor)
++        }
++        HorizontalDivider(color = Color(0xFFE3EAF2))
++        Text("订单号：${order.orderId}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF53657A))
++        Text("收货人：${order.personName}", fontWeight = FontWeight.SemiBold)
++        Text("房间号：${order.roomNumber}", fontWeight = FontWeight.SemiBold)
++        Text(
++            "商品：${order.items.joinToString("、") { "${it.productName} ×${it.quantity}" }}",
++            color = Color(0xFF44566C),
++        )
++    }
++}
++
++@Composable
++private fun VideoRecognitionCard(state: FaceEnrollmentUiState, viewModel: FaceEnrollmentViewModel) {
++    var reloadKey by rememberSaveable { mutableIntStateOf(0) }
++    val videoUrl = FaceEndpoint.normalize(state.serviceUrl)?.let { "$it/api/v1/video.mjpg" }
++    val session = state.recognitionSession
++    SectionCard("实时画面与按需识别") {
++        Box(
++            modifier = Modifier
++                .fillMaxWidth()
++                .aspectRatio(4f / 3f)
++                .clip(RoundedCornerShape(12.dp))
++                .background(Color(0xFFE7EEF7)),
++            contentAlignment = Alignment.Center,
++        ) {
++            if (videoUrl == null) {
++                Text("请先填写有效的人脸服务地址", color = Color(0xFF64748B))
++            } else {
++                MjpegVideo(videoUrl, reloadKey) { reloadKey += 1 }
++            }
++        }
++        Text(
++            "画面来自 Jetson，不会占用本机摄像头。空闲时显示流畅原始画面，识别期间自动显示带框画面。",
++            style = MaterialTheme.typography.bodySmall,
++            color = Color(0xFF64748B),
++        )
++        if (session?.active == true) {
++            val duration = session.durationSeconds.coerceAtLeast(0.1)
++            val progress = (session.remainingSeconds / duration).toFloat().coerceIn(0f, 1f)
++            LinearProgressIndicator(progress = { progress }, modifier = Modifier.fillMaxWidth())
++            Row(
++                modifier = Modifier.fillMaxWidth(),
++                horizontalArrangement = Arrangement.SpaceBetween,
++                verticalAlignment = Alignment.CenterVertically,
++            ) {
++                Column(modifier = Modifier.weight(1f)) {
++                    Text(
++                        "正在识别 · 剩余 ${kotlin.math.ceil(session.remainingSeconds).toInt()} 秒",
++                        color = AppOrange,
++                        fontWeight = FontWeight.Bold,
++                    )
++                    Text(
++                        "已处理 ${session.processedFrames} 帧，请正对小车摄像头",
++                        style = MaterialTheme.typography.bodySmall,
++                        color = Color(0xFF64748B),
++                    )
++                }
++                OutlinedButton(
++                    onClick = viewModel::cancelRecognition,
++                    enabled = !state.recognitionRequestLoading,
++                ) {
++                    Text(if (state.recognitionRequestLoading) "结束中…" else "提前结束")
++                }
++            }
++        } else {
++            Button(
++                onClick = viewModel::startRecognition,
++                modifier = Modifier.fillMaxWidth(),
++                enabled = !state.recognitionRequestLoading && videoUrl != null,
++            ) {
++                if (state.recognitionRequestLoading) {
++                    CircularProgressIndicator(
++                        modifier = Modifier.size(18.dp),
++                        strokeWidth = 2.dp,
++                        color = Color.White,
+                     )
++                    Spacer(Modifier.width(8.dp))
++                }
++                Text(if (state.recognitionRequestLoading) "正在启动…" else "开始识别（5 秒）")
++            }
++        }
++        state.recognitionError?.let { ErrorText(it) }
++        if (session?.active != true) RecognitionSessionResult(session)
++    }
++}
++
++@Composable
++private fun RecognitionSessionResult(session: RecognitionSession?) {
++    val result = session?.result ?: return
++    val (title, detail, color) = when (result.state) {
++        "recognized" -> Triple(
++            "识别成功",
++            buildString {
++                append(result.name ?: "已录入人员")
++                result.similarity?.let { append(" · 相似度 ${String.format(Locale.US, "%.3f", it)}") }
++                if (result.appearances > 0) append(" · 出现 ${result.appearances} 次")
++            },
++            AppGreen,
++        )
++        "uncertain" -> Triple(
++            "结果不确定",
++            buildString {
++                append(result.name?.let { "可能是 $it" } ?: "请调整角度后重试")
++                result.similarity?.let { append(" · 相似度 ${String.format(Locale.US, "%.3f", it)}") }
++            },
++            AppOrange,
++        )
++        "no_face" -> Triple("未检测到人脸", "请正对摄像头并保持光线充足后重试", AppOrange)
++        else -> Triple("未识别", "未匹配到已录入人员，请调整距离或光线后重试", Color(0xFF64748B))
++    }
++    Surface(color = color.copy(alpha = 0.10f), shape = RoundedCornerShape(12.dp)) {
++        Column(modifier = Modifier.fillMaxWidth().padding(12.dp)) {
++            Text(title, color = color, fontWeight = FontWeight.Bold)
++            Text(detail, color = Color(0xFF44566C), style = MaterialTheme.typography.bodySmall)
++        }
++    }
++}
++
++@Composable
++private fun MjpegVideo(url: String, reloadKey: Int, onRetry: () -> Unit) {
++    var frame by remember(url, reloadKey) { mutableStateOf<Bitmap?>(null) }
++    var phase by remember(url, reloadKey) { mutableStateOf(VideoPhase.CONNECTING) }
++    var lastError by remember(url, reloadKey) { mutableStateOf<String?>(null) }
++    val lifecycleOwner = LocalLifecycleOwner.current
++    var lifecycleActive by remember(lifecycleOwner) {
++        mutableStateOf(lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED))
++    }
++
++    DisposableEffect(lifecycleOwner) {
++        val observer = LifecycleEventObserver { _, event ->
++            when (event) {
++                Lifecycle.Event.ON_START -> lifecycleActive = true
++                Lifecycle.Event.ON_STOP -> lifecycleActive = false
++                else -> Unit
++            }
++        }
++        lifecycleOwner.lifecycle.addObserver(observer)
++        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
++    }
++
++    if (lifecycleActive) {
++        DisposableEffect(url, reloadKey) {
++            val client = MjpegStreamClient(
++                listener = object : MjpegStreamListener {
++                    override fun onConnecting() {
++                        phase = VideoPhase.CONNECTING
++                    }
++
++                    override fun onFrame(bitmap: Bitmap) {
++                        frame = bitmap
++                        lastError = null
++                        phase = VideoPhase.STREAMING
++                    }
++
++                    override fun onError(message: String) {
++                        lastError = message
++                        phase = VideoPhase.ERROR
++                    }
+                 },
+             )
+-            Spacer(Modifier.height(12.dp))
++            client.start(url)
++            onDispose { client.close() }
++        }
++    }
++
++    frame?.let { bitmap ->
++        Image(
++            bitmap = bitmap.asImageBitmap(),
++            contentDescription = "小车摄像头实时画面",
++            modifier = Modifier.fillMaxSize(),
++            contentScale = ContentScale.Fit,
++        )
++    }
++    if (frame == null || phase != VideoPhase.STREAMING) {
++        Surface(
++            color = if (frame == null) Color.Transparent else Color(0xB3000000),
++            shape = RoundedCornerShape(10.dp),
++        ) {
++            Column(
++                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
++                horizontalAlignment = Alignment.CenterHorizontally,
++            ) {
++                Text(
++                    text = when {
++                        !lifecycleActive -> "视频已暂停"
++                        phase == VideoPhase.ERROR -> "视频连接失败"
++                        lastError != null -> "正在重新连接视频…"
++                        else -> "正在加载视频…"
++                    },
++                    color = if (frame == null) Color(0xFF586A7E) else Color.White,
++                    fontWeight = FontWeight.SemiBold,
++                )
++                lastError?.let { message ->
++                    Text(
++                        text = message,
++                        style = MaterialTheme.typography.labelSmall,
++                        color = if (frame == null) Color(0xFF7A4C00) else Color(0xFFFFD7A3),
++                    )
++                    TextButton(onClick = onRetry) { Text("重新加载") }
++                }
++            }
+         }
+     }
+ }
+ 
++private enum class VideoPhase { CONNECTING, STREAMING, ERROR }
++
+ @Composable
+-private fun Header(state: FaceEnrollmentUiState) {
++private fun Header(state: FaceEnrollmentUiState, selectedPage: Int) {
+     val (badge, badgeColor) = when {
+         state.statusLoading && state.serviceStatus == null -> "连接中" to AppOrange
+         state.statusError != null -> "连接异常" to AppRed
+@@ -214,8 +666,17 @@ private fun Header(state: FaceEnrollmentUiState) {
+         horizontalArrangement = Arrangement.SpaceBetween,
+     ) {
+         Column(modifier = Modifier.weight(1f)) {
+-            Text("用户人脸采集", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF172033))
+-            Text("手机采集 · Jetson 录入 · 小车识别", color = Color(0xFF53657A))
++            Text(
++                if (selectedPage == 0) "用户人脸采集" else "用户商品下单",
++                fontSize = 26.sp,
++                fontWeight = FontWeight.Bold,
++                color = Color(0xFF172033),
++            )
++            Text(
++                if (selectedPage == 0) "手机采集 · Jetson 录入 · 小车识别"
++                else "填写收货信息 · 选择商品 · 等待配送",
++                color = Color(0xFF53657A),
++            )
+         }
+         StatusBadge(badge, badgeColor)
+     }
+diff --git a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/data/FaceApiClient.kt b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/data/FaceApiClient.kt
+index 05f2e6f..b870027 100644
+--- a/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/data/FaceApiClient.kt
++++ b/face-enrollment-app/app/src/main/java/cn/edu/xxq/faceenrollment/data/FaceApiClient.kt
+@@ -57,16 +57,62 @@ data class ServiceStatus(
+     val recognition: RecognitionStatus = RecognitionStatus(),
+     val database: DatabaseStatus = DatabaseStatus(),
+     val latest: LatestRecognition? = null,
++    val recognitionSession: RecognitionSession? = null,
++)
++
++data class RecognitionSessionResult(
++    val state: String,
++    val name: String? = null,
++    val similarity: Double? = null,
++    val appearances: Int = 0,
++)
++
++data class RecognitionSession(
++    val state: String = "idle",
++    val active: Boolean = false,
++    val sessionId: String? = null,
++    val durationSeconds: Double = 5.0,
++    val remainingSeconds: Double = 0.0,
++    val processedFrames: Int = 0,
++    val result: RecognitionSessionResult? = null,
+ )
+ 
+ data class EnrollmentReceipt(
+     val name: String,
++    val personId: String? = null,
+     val acceptedSamples: Int,
+     val totalSamples: Int? = null,
+     val databaseRevision: Long? = null,
+     val message: String? = null,
+ )
+ 
++data class CatalogProduct(
++    val productId: String,
++    val name: String,
++    val enabled: Boolean,
++)
++
++data class OrderItemRequest(
++    val productId: String,
++    val quantity: Int,
++)
++
++data class OrderItemReceipt(
++    val productId: String,
++    val productName: String,
++    val quantity: Int,
++)
++
++data class OrderReceipt(
++    val orderId: String,
++    val personId: String? = null,
++    val personName: String,
++    val roomNumber: String,
++    val status: String,
++    val items: List<OrderItemReceipt>,
++    val createdAt: String? = null,
++)
++
+ object FaceEndpoint {
+     fun normalize(value: String): String? {
+         val trimmed = value.trim()
+@@ -148,6 +194,80 @@ class FaceApiClient(
+         }
+     }
+ 
++    fun getCatalog(baseUrl: String): ApiResult<List<CatalogProduct>> {
++        val url = FaceEndpoint.apiUrl(baseUrl, "api", "v1", "catalog") ?: return invalidAddress()
++        val networkRequest = request(url, apiKey)
++            .tag(CatalogRequestTag::class.java, CatalogRequestTag)
++            .get()
++            .build()
++        return executeJson(networkRequest, FaceApiJson::parseCatalog)
++    }
++
++    fun createOrder(
++        baseUrl: String,
++        personId: String,
++        personName: String,
++        roomNumber: String,
++        items: List<OrderItemRequest>,
++    ): ApiResult<OrderReceipt> {
++        val cleanPersonId = personId.trim()
++        val cleanName = personName.trim()
++        val cleanRoom = roomNumber.trim()
++        if (cleanPersonId.isEmpty()) return ApiResult.Failure("请先完成人脸录入")
++        if (cleanName.isEmpty()) return ApiResult.Failure("姓名不能为空")
++        if (cleanRoom.isEmpty()) return ApiResult.Failure("房间号不能为空")
++        if (items.isEmpty()) return ApiResult.Failure("请至少选择一件商品")
++
++        val url = FaceEndpoint.apiUrl(baseUrl, "api", "v1", "orders") ?: return invalidAddress()
++        val payload = FaceApiJson.orderPayload(cleanPersonId, cleanName, cleanRoom, items)
++        val body = payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType())
++        val networkRequest = request(url, apiKey)
++            .tag(OrderRequestTag::class.java, OrderRequestTag)
++            .post(body)
++            .build()
++        return executeJson(networkRequest, FaceApiJson::parseOrder)
++    }
++
++    fun startRecognitionSession(
++        baseUrl: String,
++        durationSeconds: Int = 5,
++    ): ApiResult<RecognitionSession> {
++        val url = recognitionSessionUrl(baseUrl) ?: return invalidAddress()
++        val body = JSONObject()
++            .put("duration_seconds", durationSeconds.coerceIn(1, 10))
++            .toString()
++            .toRequestBody("application/json; charset=utf-8".toMediaType())
++        val networkRequest = request(url, apiKey)
++            .tag(RecognitionRequestTag::class.java, RecognitionRequestTag)
++            .post(body)
++            .build()
++        return executeJson(networkRequest, FaceApiJson::parseRecognitionSession)
++    }
++
++    fun getRecognitionSession(baseUrl: String): ApiResult<RecognitionSession> {
++        val url = recognitionSessionUrl(baseUrl) ?: return invalidAddress()
++        val networkRequest = request(url, apiKey)
++            .tag(RecognitionRequestTag::class.java, RecognitionRequestTag)
++            .get()
++            .build()
++        return executeJson(networkRequest, FaceApiJson::parseRecognitionSession)
++    }
++
++    fun cancelRecognitionSession(baseUrl: String): ApiResult<RecognitionSession> {
++        val url = recognitionSessionUrl(baseUrl) ?: return invalidAddress()
++        val networkRequest = request(url, apiKey)
++            .tag(RecognitionRequestTag::class.java, RecognitionRequestTag)
++            .delete()
++            .build()
++        return executeJson(networkRequest, FaceApiJson::parseRecognitionSession)
++    }
++
++    private fun recognitionSessionUrl(baseUrl: String): HttpUrl? =
++        FaceEndpoint.apiUrl(baseUrl, "api", "v1", "recognition", "session")
++
++    private fun invalidAddress(): ApiResult.Failure =
++        ApiResult.Failure("服务地址无效，请填写 http:// 或 https:// 地址")
++
+     private fun request(url: HttpUrl, apiKey: String): Request.Builder = Request.Builder()
+         .url(url)
+         .header(API_KEY_HEADER, apiKey.trim())
+@@ -196,6 +316,27 @@ class FaceApiClient(
+         }.forEach { it.cancel() }
+     }
+ 
++    fun cancelRecognitionRequests() {
++        val calls = client.dispatcher.queuedCalls() + client.dispatcher.runningCalls()
++        calls.filter {
++            it.request().tag(RecognitionRequestTag::class.java) === RecognitionRequestTag
++        }.forEach { it.cancel() }
++    }
++
++    fun cancelCatalogRequests() {
++        val calls = client.dispatcher.queuedCalls() + client.dispatcher.runningCalls()
++        calls.filter {
++            it.request().tag(CatalogRequestTag::class.java) === CatalogRequestTag
++        }.forEach { it.cancel() }
++    }
++
++    fun cancelOrderRequests() {
++        val calls = client.dispatcher.queuedCalls() + client.dispatcher.runningCalls()
++        calls.filter {
++            it.request().tag(OrderRequestTag::class.java) === OrderRequestTag
++        }.forEach { it.cancel() }
++    }
++
+     override fun close() {
+         client.dispatcher.cancelAll()
+         client.connectionPool.evictAll()
+@@ -203,9 +344,33 @@ class FaceApiClient(
+     }
+ 
+     private object StatusRequestTag
++    private object RecognitionRequestTag
++    private object CatalogRequestTag
++    private object OrderRequestTag
+ }
+ 
+ internal object FaceApiJson {
++    fun orderPayload(
++        personId: String,
++        personName: String,
++        roomNumber: String,
++        items: List<OrderItemRequest>,
++    ): JSONObject {
++        val itemArray = JSONArray()
++        items.forEach { item ->
++            itemArray.put(
++                JSONObject()
++                    .put("product_id", item.productId)
++                    .put("quantity", item.quantity),
++            )
++        }
++        return JSONObject()
++            .put("person_id", personId.trim())
++            .put("person_name", personName.trim())
++            .put("room_number", roomNumber.trim())
++            .put("items", itemArray)
++    }
++
+     fun parseError(json: JSONObject): String? {
+         return when (val error = json.opt("error")) {
+             is JSONObject -> {
+@@ -244,6 +409,9 @@ internal object FaceApiJson {
+         }.coerceAtLeast(0)
+         return EnrollmentReceipt(
+             name = nestedName.ifBlank { topLevelName }.ifBlank { fallbackName },
++            personId = person?.optNullableString("person_id")
++                ?: person?.optNullableString("id")
++                ?: json.optNullableString("person_id"),
+             acceptedSamples = acceptedSamples,
+             totalSamples = totalSamples,
+             databaseRevision = json.optLongOrNull("database_revision"),
+@@ -251,6 +419,62 @@ internal object FaceApiJson {
+         )
+     }
+ 
++    fun parseCatalog(json: JSONObject): List<CatalogProduct> {
++        val products = json.optJSONArray("products")
++            ?: throw JSONException("缺少 products")
++        val seenIds = mutableSetOf<String>()
++        return buildList {
++            for (index in 0 until products.length()) {
++                val value = products.optJSONObject(index)
++                    ?: throw JSONException("products[$index] 不是对象")
++                val productId = value.optNullableString("product_id")
++                    ?: throw JSONException("products[$index] 缺少 product_id")
++                val name = value.optNullableString("name")
++                    ?: throw JSONException("products[$index] 缺少 name")
++                if (!seenIds.add(productId)) continue
++                add(
++                    CatalogProduct(
++                        productId = productId,
++                        name = name,
++                        enabled = value.optBoolean("enabled", false),
++                    ),
++                )
++            }
++        }
++    }
++
++    fun parseOrder(json: JSONObject): OrderReceipt {
++        val order = json.optJSONObject("order") ?: throw JSONException("缺少 order")
++        val orderId = order.optNullableString("order_id") ?: throw JSONException("缺少 order_id")
++        val personName = order.optNullableString("person_name") ?: throw JSONException("缺少 person_name")
++        val roomNumber = order.optNullableString("room_number") ?: throw JSONException("缺少 room_number")
++        val status = order.optNullableString("status") ?: throw JSONException("缺少 status")
++        val itemsJson = order.optJSONArray("items") ?: throw JSONException("缺少 items")
++        val items = buildList {
++            for (index in 0 until itemsJson.length()) {
++                val value = itemsJson.optJSONObject(index)
++                    ?: throw JSONException("items[$index] 不是对象")
++                val productId = value.optNullableString("product_id")
++                    ?: throw JSONException("items[$index] 缺少 product_id")
++                val productName = value.optNullableString("product_name")
++                    ?: throw JSONException("items[$index] 缺少 product_name")
++                val quantity = value.optInt("quantity", 0)
++                if (quantity <= 0) throw JSONException("items[$index] quantity 无效")
++                add(OrderItemReceipt(productId, productName, quantity))
++            }
++        }
++        if (items.isEmpty()) throw JSONException("订单商品不能为空")
++        return OrderReceipt(
++            orderId = orderId,
++            personId = order.optNullableString("person_id"),
++            personName = personName,
++            roomNumber = roomNumber,
++            status = status.lowercase(),
++            items = items,
++            createdAt = order.optNullableString("created_at"),
++        )
++    }
++
+     fun parseStatus(json: JSONObject): ServiceStatus {
+         val cameraJson = json.optJSONObject("camera")
+         val recognitionJson = json.optJSONObject("recognition")
+@@ -290,6 +514,34 @@ internal object FaceApiJson {
+                 samples = databaseJson?.optInt("samples", 0)?.coerceAtLeast(0) ?: 0,
+             ),
+             latest = latest,
++            recognitionSession = json.optJSONObject("recognition_session")?.let(::parseRecognitionSessionObject),
++        )
++    }
++
++    fun parseRecognitionSession(json: JSONObject): RecognitionSession {
++        val value = json.optJSONObject("recognition_session") ?: json
++        return parseRecognitionSessionObject(value)
++    }
++
++    private fun parseRecognitionSessionObject(value: JSONObject): RecognitionSession {
++        val active = value.optBoolean("active", false)
++        val result = value.optJSONObject("result")?.let { resultJson ->
++            val state = resultJson.optNullableString("state")?.lowercase() ?: "unknown"
++            RecognitionSessionResult(
++                state = state,
++                name = resultJson.optNullableString("name"),
++                similarity = resultJson.optFiniteDouble("similarity"),
++                appearances = resultJson.optInt("appearances", 0).coerceAtLeast(0),
++            )
++        }
++        return RecognitionSession(
++            state = value.optNullableString("state")?.lowercase() ?: if (active) "active" else "idle",
++            active = active,
++            sessionId = value.optNullableString("session_id"),
++            durationSeconds = (value.optFiniteDouble("duration_seconds") ?: 5.0).coerceAtLeast(0.0),
++            remainingSeconds = (value.optFiniteDouble("remaining_seconds") ?: 0.0).coerceAtLeast(0.0),
++            processedFrames = value.optInt("processed_frames", 0).coerceAtLeast(0),
++            result = result,
+         )
+     }
+ }
+diff --git a/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceApiJsonTest.kt b/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceApiJsonTest.kt
+index d236166..1d8930d 100644
+--- a/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceApiJsonTest.kt
++++ b/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceApiJsonTest.kt
+@@ -8,6 +8,25 @@ import org.junit.Assert.assertTrue
+ import org.junit.Test
+ 
+ class FaceApiJsonTest {
++    @Test
++    fun orderPayload_usesOnlyPublicOrderContractFields() {
++        val payload = FaceApiJson.orderPayload(
++            personId = " person-123 ",
++            personName = " 张三 ",
++            roomNumber = " A302 ",
++            items = listOf(OrderItemRequest("water", 2)),
++        )
++
++        assertEquals(setOf("person_id", "person_name", "room_number", "items"), payload.keySet())
++        assertEquals("person-123", payload.getString("person_id"))
++        assertEquals("张三", payload.getString("person_name"))
++        assertEquals("A302", payload.getString("room_number"))
++        val item = payload.getJSONArray("items").getJSONObject(0)
++        assertEquals(setOf("product_id", "quantity"), item.keySet())
++        assertEquals("water", item.getString("product_id"))
++        assertEquals(2, item.getInt("quantity"))
++    }
++
+     @Test
+     fun parseError_prefersStructuredMessageAndKeepsCode() {
+         val json = JSONObject(
+@@ -46,6 +65,76 @@ class FaceApiJsonTest {
+         assertEquals(42L, receipt.databaseRevision)
+     }
+ 
++    @Test
++    fun parseEnrollment_keepsStablePersonIdForOrderDefaults() {
++        val receipt = FaceApiJson.parseEnrollment(
++            JSONObject(
++                """{"ok":true,"person":{"person_id":"person-123","name":"张三","samples":2}}""",
++            ),
++            "fallback",
++            2,
++        )
++
++        assertEquals("person-123", receipt.personId)
++        assertEquals("张三", receipt.name)
++    }
++
++    @Test
++    fun parseCatalog_readsProductsAndIgnoresDuplicateIds() {
++        val products = FaceApiJson.parseCatalog(
++            JSONObject(
++                """
++                {
++                  "ok": true,
++                  "products": [
++                    {"product_id":"water","name":"矿泉水","enabled":true},
++                    {"product_id":"snack","name":"饼干","enabled":false},
++                    {"product_id":"water","name":"重复水","enabled":true}
++                  ]
++                }
++                """.trimIndent(),
++            ),
++        )
++
++        assertEquals(2, products.size)
++        assertEquals("矿泉水", products[0].name)
++        assertTrue(products[0].enabled)
++        assertFalse(products[1].enabled)
++    }
++
++    @Test
++    fun parseOrder_readsStableOrderFieldsAndItems() {
++        val order = FaceApiJson.parseOrder(
++            JSONObject(
++                """
++                {
++                  "ok": true,
++                  "order": {
++                    "order_id":"order-456",
++                    "person_id":"person-123",
++                    "person_name":"张三",
++                    "room_number":"A302",
++                    "status":"PENDING",
++                    "created_at":"2026-07-14T21:00:00+08:00",
++                    "items":[
++                      {"product_id":"water","product_name":"矿泉水","quantity":2},
++                      {"product_id":"snack","product_name":"饼干","quantity":1}
++                    ]
++                  }
++                }
++                """.trimIndent(),
++            ),
++        )
++
++        assertEquals("order-456", order.orderId)
++        assertEquals("person-123", order.personId)
++        assertEquals("张三", order.personName)
++        assertEquals("A302", order.roomNumber)
++        assertEquals("pending", order.status)
++        assertEquals(listOf("矿泉水", "饼干"), order.items.map { it.productName })
++        assertEquals(listOf(2, 1), order.items.map { it.quantity })
++    }
++
+     @Test
+     fun parseEnrollment_keepsLegacyTopLevelCompatibility() {
+         val receipt = FaceApiJson.parseEnrollment(
+@@ -138,4 +227,94 @@ class FaceApiJsonTest {
+         assertEquals(0, status.database.people)
+         assertNull(status.latest)
+     }
++
++    @Test
++    fun parseStatus_readsActiveRecognitionSession() {
++        val status = FaceApiJson.parseStatus(
++            JSONObject(
++                """
++                {
++                  "ok": true,
++                  "recognition_session": {
++                    "state": "active",
++                    "active": true,
++                    "session_id": "session-123",
++                    "duration_seconds": 5,
++                    "remaining_seconds": 3.4,
++                    "processed_frames": 2,
++                    "result": null
++                  }
++                }
++                """.trimIndent(),
++            ),
++        )
++
++        assertTrue(status.recognitionSession?.active == true)
++        assertEquals("session-123", status.recognitionSession?.sessionId)
++        assertEquals(3.4, status.recognitionSession?.remainingSeconds ?: 0.0, 0.0001)
++        assertEquals(2, status.recognitionSession?.processedFrames)
++        assertNull(status.recognitionSession?.result)
++    }
++
++    @Test
++    fun parseRecognitionSession_readsCompletedRecognizedResult() {
++        val session = FaceApiJson.parseRecognitionSession(
++            JSONObject(
++                """
++                {
++                  "ok": true,
++                  "recognition_session": {
++                    "state": "completed",
++                    "active": false,
++                    "session_id": "session-456",
++                    "duration_seconds": 5.0,
++                    "remaining_seconds": 0,
++                    "processed_frames": 9,
++                    "result": {
++                      "state": "recognized",
++                      "name": "张三",
++                      "similarity": 0.812,
++                      "appearances": 4
++                    }
++                  }
++                }
++                """.trimIndent(),
++            ),
++        )
++
++        assertFalse(session.active)
++        assertEquals("completed", session.state)
++        assertEquals("recognized", session.result?.state)
++        assertEquals("张三", session.result?.name)
++        assertEquals(0.812, session.result?.similarity ?: 0.0, 0.0001)
++        assertEquals(4, session.result?.appearances)
++    }
++
++    @Test
++    fun parseRecognitionSession_acceptsTopLevelAndNullUnknownResultFields() {
++        val session = FaceApiJson.parseRecognitionSession(
++            JSONObject(
++                """
++                {
++                  "ok": true,
++                  "state": "completed",
++                  "active": false,
++                  "processed_frames": -1,
++                  "result": {
++                    "state": "unknown",
++                    "name": null,
++                    "similarity": null,
++                    "appearances": -3
++                  }
++                }
++                """.trimIndent(),
++            ),
++        )
++
++        assertEquals(0, session.processedFrames)
++        assertEquals("unknown", session.result?.state)
++        assertNull(session.result?.name)
++        assertNull(session.result?.similarity)
++        assertEquals(0, session.result?.appearances)
++    }
+ }
+diff --git a/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceEndpointTest.kt b/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceEndpointTest.kt
+index 2648d25..e106c97 100644
+--- a/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceEndpointTest.kt
++++ b/face-enrollment-app/app/src/test/java/cn/edu/xxq/faceenrollment/data/FaceEndpointTest.kt
+@@ -20,4 +20,32 @@ class FaceEndpointTest {
+         assertNull(FaceEndpoint.normalize("http://10.39.132.165:9095/?token=secret"))
+     }
+ 
++    @Test
++    fun apiUrl_buildsRecognitionSessionPath() {
++        assertEquals(
++            "http://10.39.132.165:9095/api/v1/recognition/session",
++            FaceEndpoint.apiUrl(
++                "http://10.39.132.165:9095",
++                "api",
++                "v1",
++                "recognition",
++                "session",
++            )?.toString(),
++        )
++    }
++
++    @Test
++    fun apiUrl_buildsCatalogAndOrdersPaths() {
++        val baseUrl = "http://10.39.132.165:9095"
++
++        assertEquals(
++            "$baseUrl/api/v1/catalog",
++            FaceEndpoint.apiUrl(baseUrl, "api", "v1", "catalog")?.toString(),
++        )
++        assertEquals(
++            "$baseUrl/api/v1/orders",
++            FaceEndpoint.apiUrl(baseUrl, "api", "v1", "orders")?.toString(),
++        )
++    }
++
+ }
