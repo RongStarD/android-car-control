@@ -1,0 +1,9 @@
+# Requested operating mode: idle, manual, slam, nav_dwa or nav_teb.
+string mode
+# Reserved for recovery workflows. It never permits duplicate ROS nodes.
+bool force
+---
+bool success
+string accepted_mode
+string runtime_state
+string message

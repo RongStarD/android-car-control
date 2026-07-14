@@ -1,0 +1,648 @@
+diff --git a/robot_app_api.py b/robot_app_api.py
+index 4791862..a51f2bb 100644
+--- a/robot_app_api.py
++++ b/robot_app_api.py
+@@ -31,7 +31,9 @@ class RobotAppApi(Node):
+     SENSOR_STALE_SECONDS = 2.5
+     COSTMAP_STALE_SECONDS = 5.0
+     STARTUP_TIMEOUT_SECONDS = 45.0
++    SAFETY_ZERO_WINDOW_SECONDS = 1.0
+     NAVIGATION_NODES = (
++        "amcl",
+         "bt_navigator",
+         "controller_server",
+         "planner_server",
+@@ -54,16 +56,32 @@ class RobotAppApi(Node):
+         self.navigation_algorithm = None
+         self.navigation_started_at = None
+         self.navigation_initial_pose_at = None
++        self.last_amcl_pose_at = None
+         self.navigation_timeout_reported = False
+         self.mapping_started_at = None
+         self.navigation_base_started_at = None
+         self.active_goal = None
++        self.active_goal_sequence = None
++        self.pending_goal_future = None
++        self.pending_goal_sequence = None
++        self.cancel_pending_goal = None
++        self.cancel_requested_sequences = set()
++        self.terminal_goal_sequences = set()
++        self.zero_guard_sequences = set()
++        self.zero_guard_until = 0.0
++        self.goal_sequence = 0
++        self.goal_state = {
++            "sequence": 0,
++            "state": "idle",
++            "result_status": None,
++        }
+         self.last_feedback_time = 0.0
+         self.navigation_ready = None
+         self.mapping_active = None
+         self.navigation_active = None
+         self.last_scan_at = None
+         self.last_odom_at = None
++        self.last_odom_to_base_at = None
+         self.last_map_at = None
+         self.last_local_costmap_at = None
+         self.last_global_costmap_at = None
+@@ -76,15 +94,21 @@ class RobotAppApi(Node):
+             "error": "",
+         }
+         state_qos = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
++        self.state_qos = state_qos
+         self.status = self.create_publisher(String, "/app/navigation_status", state_qos)
+         self.ready = self.create_publisher(Bool, "/app/navigation_ready", state_qos)
+         self.mapping_state = self.create_publisher(Bool, "/app/mapping_active", state_qos)
+         self.navigation_state = self.create_publisher(Bool, "/app/navigation_active", state_qos)
+         self.runtime_state = self.create_publisher(String, "/app/runtime_state", state_qos)
++        self.navigation_goal_state = self.create_publisher(String, "/app/navigation_goal_state", state_qos)
+         self.runtime_state.publish(String(data=json.dumps(self.runtime, ensure_ascii=False, separators=(",", ":"))))
++        self.navigation_goal_state.publish(
++            String(data=json.dumps(self.goal_state, ensure_ascii=False, separators=(",", ":")))
++        )
+         self.cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
+         self.goal_subscription = self.create_subscription(PoseStamped, "/app/goal_pose", self.navigate_to_pose, 10)
+         self.create_subscription(PoseWithCovarianceStamped, "/initialpose", self._on_initial_pose, 10)
++        self.create_subscription(PoseWithCovarianceStamped, "/amcl_pose", self._on_amcl_pose, 10)
+         self.create_subscription(LaserScan, "/scan", self._on_scan, 10)
+         self.create_subscription(Odometry, "/odom", self._on_odom, 20)
+         # Volatile subscriptions accept both ordinary live publishers (GMapping)
+@@ -93,7 +117,10 @@ class RobotAppApi(Node):
+         self.create_subscription(OccupancyGrid, "/map", self._on_map, 10)
+         self.create_subscription(OccupancyGrid, "/local_costmap/costmap", self._on_local_costmap, 10)
+         self.create_subscription(OccupancyGrid, "/global_costmap/costmap", self._on_global_costmap, 10)
+-        self.create_subscription(TFMessage, "/tf_static", self._on_tf_static, state_qos)
++        self.create_subscription(TFMessage, "/tf", self._on_tf, 20)
++        self.tf_static_subscription = self.create_subscription(
++            TFMessage, "/tf_static", self._on_tf_static, state_qos
++        )
+         self.navigate_action = ActionClient(self, NavigateToPose, "navigate_to_pose")
+         self.create_service(Trigger, "/app/load_saved_map", self.load_saved_map)
+         self.create_service(Trigger, "/app/start_mapping", self.start_mapping)
+@@ -106,6 +133,7 @@ class RobotAppApi(Node):
+         self.create_service(Trigger, "/app/stop_navigation", self.stop_navigation)
+         self.create_service(Trigger, "/app/emergency_stop", self.emergency_stop)
+         self.create_timer(0.5, self._refresh_runtime_state)
++        self.create_timer(0.02, self._safety_guard_tick)
+ 
+     def start_mapping(self, request, response):
+         if self._is_process_running(self.mapping_process) or self._node_exists("slam_gmapping"):
+@@ -161,7 +189,15 @@ class RobotAppApi(Node):
+ 
+     def start_navigation_base(self, request, response):
+         self._stop_mapping_environment()
+-        if self._is_process_running(self.navigation_base_process) or self._base_is_ready():
++        self._stop_manual_keyboard_control()
++        self._reset_base_health()
++        self.navigation_base_started_at = time.monotonic()
++        if (
++            self._is_process_running(self.navigation_base_process)
++            or self._base_is_ready()
++            or self._node_exists("base_node")
++            or self._node_exists("sllidar_node")
++        ):
+             self._set_runtime("navigation_base", "checking", False, "n1 已存在，正在检查底盘、雷达和 TF")
+             return self._reply(response, True, "导航基础节点已在运行")
+         self.navigation_base_process, error = self._start_launch("laser_bringup_launch.py")
+@@ -179,48 +215,69 @@ class RobotAppApi(Node):
+         return self._start_navigation(response, "navigation_teb_launch.py", "TEB")
+ 
+     def cancel_navigation(self, request, response):
+-        if self.active_goal is None:
++        sequence = self._request_current_goal_cancel("cancel")
++        if sequence is None:
++            self._start_zero_guard()
+             self._set_navigation_active(False)
+-            return self._reply(response, True, "当前没有正在执行的导航目标")
+-        self.active_goal.cancel_goal_async()
+-        self._set_navigation_active(False)
+-        self._publish_status("已请求取消导航")
+-        return self._reply(response, True, "已请求取消导航")
++            return self._reply(response, True, "当前没有导航目标；已短时保持零速度")
++        self._publish_status(f"导航目标 {sequence}：已请求取消，等待 Nav2 最终确认")
++        return self._reply(response, True, f"已请求取消目标 {sequence}，正在等待 Nav2 最终结果")
+ 
+     def stop_navigation(self, request, response):
+-        if self.active_goal is not None:
+-            self.active_goal.cancel_goal_async()
+-        self._set_navigation_active(False)
++        sequence = self._request_current_goal_cancel("stop")
++        self._start_zero_guard(sequence)
+         self._stop_navigation_stack()
++        if sequence is not None:
++            self._finish_goal_locally(sequence, "stopped")
+         self._stop_launch_process(self.navigation_base_process, "laser_bringup_launch.py")
+         self.navigation_base_process = None
+         self.navigation_base_started_at = None
++        self._reset_base_health()
+         self._set_runtime("idle", "idle", False, "导航环境已停止")
+-        return self._reply(response, True, "已结束 n1/n3/n4 导航环境")
++        return self._reply(response, True, "已发布零速度并结束 n1/n3/n4 导航环境")
+ 
+     def emergency_stop(self, request, response):
+-        if self.active_goal is not None:
+-            self.active_goal.cancel_goal_async()
+-        self._set_navigation_active(False)
++        sequence = self._request_current_goal_cancel("emergency_stop")
++        self._start_zero_guard(sequence)
++        # Safety takes priority over preserving the planner process. Stop only
++        # n3/n4 so Nav2 can no longer interleave a non-zero command; n1 remains
++        # available for a later manual takeover or planner restart.
++        self._stop_navigation_stack()
+         self.cmd_vel.publish(Twist())
+-        self._publish_status("已紧急停止：已发布零速度并取消当前导航目标")
+-        return self._reply(response, True, "已紧急停止")
++        self._start_zero_guard()
++        self._set_runtime(
++            "navigation_base",
++            "checking",
++            False,
++            "紧急停止已生效；保留 n1，重新导航前请启动 DWA/TEB",
++        )
++        self._publish_status("紧急停止：已停止 Nav2 规划器并保留 n1")
++        return self._reply(response, True, "紧急停止已生效：已停止 DWA/TEB 并保留 n1")
+ 
+     def navigate_to_pose(self, pose):
+         if not self._navigation_stack_is_ready():
+-            self._publish_status("Nav2 正在启动；请等待“Nav2 已就绪”后再发送目标")
++            self._publish_status("Nav2 尚未就绪，请稍后再发送目标")
+             return
+-        if self.active_goal is not None:
+-            self.active_goal.cancel_goal_async()
+-            self._set_navigation_active(False)
++        if self.pending_goal_future is not None or self.active_goal is not None:
++            sequence = self._request_current_goal_cancel("superseded")
++            self._publish_status(
++                f"目标 {sequence} 尚未结束；已请求取消，请等待终态后再发送新目标"
++            )
++            return
++        self.goal_sequence += 1
++        sequence = self.goal_sequence
+         goal = NavigateToPose.Goal()
+         goal.pose = pose
+-        self._publish_status("已发送目标，等待 Nav2 接受")
++        self._set_goal_state(sequence, "pending_accept", None)
++        self._publish_status(f"目标 {sequence} 已发送，等待 Nav2 接受")
+         future = self.navigate_action.send_goal_async(goal, feedback_callback=self._navigation_feedback)
+-        future.add_done_callback(self._goal_response)
++        self.pending_goal_future = future
++        self.pending_goal_sequence = sequence
++        future.add_done_callback(lambda result, target=sequence: self._goal_response(result, target))
+ 
+     def _start_navigation(self, response, launch_file, algorithm):
+         self._stop_mapping_environment()
++        self._stop_manual_keyboard_control()
+         if not self._base_is_ready():
+             return self._reply(response, False, "未检测到 n1 基础节点；请先启动导航基础节点")
+         if self.navigation_algorithm == algorithm and (
+@@ -229,6 +286,8 @@ class RobotAppApi(Node):
+             message = f"{algorithm} Nav2 已在运行，将直接复用" if self._node_exists("bt_navigator") else f"{algorithm} Nav2 正在启动"
+             return self._reply(response, True, message)
+         if self._is_process_running(self.navigation_process) or self._node_exists("bt_navigator"):
++            sequence = self._request_current_goal_cancel("planner_switch")
++            self._start_zero_guard(sequence)
+             self._publish_status("正在停止当前导航算法")
+             self._stop_navigation_stack()
+         # navigation_*_launch.py starts Nav2's map_server. Stop the temporary
+@@ -241,6 +300,9 @@ class RobotAppApi(Node):
+             self.navigation_algorithm = algorithm
+             self.navigation_started_at = time.monotonic()
+             self.navigation_initial_pose_at = None
++            self.last_amcl_pose_at = None
++            self.last_local_costmap_at = None
++            self.last_global_costmap_at = None
+             self.navigation_timeout_reported = False
+             self._set_runtime("navigation", "starting", False, f"已启动 {algorithm}，等待 Nav2 节点、代价地图与 Action Server")
+             self._publish_status(f"已启动 {algorithm} 导航，等待 Nav2 就绪")
+@@ -248,37 +310,164 @@ class RobotAppApi(Node):
+ 
+     def _stop_mapping_environment(self):
+         """Stop m1 before entering navigation mode; App touch controls replace m3."""
++        stopped_mapping = False
+         if self._is_process_running(self.mapping_process) or self._node_exists("slam_gmapping"):
+             self._stop_launch_process(self.mapping_process, "map_gmapping_launch.py")
+             self.mapping_process = None
++            stopped_mapping = True
+         self._set_mapping_active(False)
++        if stopped_mapping:
++            self._reset_base_health()
++
++    def _stop_manual_keyboard_control(self):
++        """Stop only the terminal m3 node; joy_ctrl remains part of n1."""
++        result = subprocess.run(
++            ["bash", "-lc", "pkill -INT -f '[y]ahboom_keyboard' || true"],
++            stdout=subprocess.DEVNULL,
++            stderr=subprocess.DEVNULL,
++            check=False,
++        )
++        if result.returncode == 0:
++            self.get_logger().info("Stopped manual yahboom_keyboard control before navigation")
+ 
+     def _stop_navigation_environment(self):
+         """Stop n1/n3/n4 before entering mapping mode."""
+-        if self.active_goal is not None:
+-            self.active_goal.cancel_goal_async()
++        sequence = self._request_current_goal_cancel("mode_switch")
++        self._start_zero_guard(sequence)
+         self._stop_navigation_stack()
++        if sequence is not None:
++            self._finish_goal_locally(sequence, "stopped")
+         if self._is_process_running(self.navigation_base_process) or self._is_fresh(self.last_odom_at, self.SENSOR_STALE_SECONDS):
+             self._stop_launch_process(self.navigation_base_process, "laser_bringup_launch.py")
+             self.navigation_base_process = None
++        self._reset_base_health()
++
++    def _set_goal_state(self, sequence, state, result_status):
++        goal_state = {
++            "sequence": int(sequence),
++            "state": str(state),
++            "result_status": result_status,
++        }
++        if goal_state == self.goal_state:
++            return
++        self.goal_state = goal_state
++        self.navigation_goal_state.publish(
++            String(data=json.dumps(goal_state, ensure_ascii=False, separators=(",", ":")))
++        )
++
++    def _start_zero_guard(self, sequence=None):
++        self.zero_guard_until = max(
++            self.zero_guard_until,
++            time.monotonic() + self.SAFETY_ZERO_WINDOW_SECONDS,
++        )
++        if sequence is not None and sequence not in self.terminal_goal_sequences:
++            self.zero_guard_sequences.add(sequence)
++        self.cmd_vel.publish(Twist())
++
++    def _safety_guard_tick(self):
++        if time.monotonic() < self.zero_guard_until or self.zero_guard_sequences:
++            self.cmd_vel.publish(Twist())
++
++    def _current_goal_sequence(self):
++        if self.pending_goal_sequence is not None:
++            return self.pending_goal_sequence
++        return self.active_goal_sequence
++
++    def _request_current_goal_cancel(self, reason):
++        sequence = self._current_goal_sequence()
++        if sequence is None:
++            return None
++        self.cancel_requested_sequences.add(sequence)
++        self._start_zero_guard(sequence)
++        if self.goal_state.get("sequence") == sequence:
++            self._set_goal_state(sequence, "cancel_requested", None)
++        if self.active_goal is not None and self.active_goal_sequence == sequence:
++            self._request_goal_handle_cancel(self.active_goal, sequence)
++        self.get_logger().warning(f"Goal {sequence} cancellation requested: {reason}")
++        return sequence
++
++    def _request_goal_handle_cancel(self, goal, sequence):
++        if self.cancel_pending_goal is goal:
++            return
++        self.cancel_pending_goal = goal
++        future = goal.cancel_goal_async()
++        future.add_done_callback(
++            lambda result, target=goal, target_sequence=sequence:
++            self._cancel_response(result, target, target_sequence)
++        )
+ 
+-    def _goal_response(self, future):
++    def _cancel_response(self, future, goal, sequence):
++        if self.cancel_pending_goal is goal:
++            self.cancel_pending_goal = None
+         try:
+-            self.active_goal = future.result()
++            response = future.result()
+         except Exception as error:
+-            self._publish_status(f"导航目标发送失败：{error}")
++            self._publish_status(f"目标 {sequence} 取消请求失败：{error}")
+             return
+-        if not self.active_goal.accepted:
+-            self.active_goal = None
+-            self._set_navigation_active(False)
+-            self._publish_status("Nav2 拒绝该导航目标")
++        if response.goals_canceling:
++            self._publish_status(f"目标 {sequence}：Nav2 已接受取消，等待最终结果")
++        else:
++            self._publish_status(f"目标 {sequence}：Nav2 未接受取消，继续保持零速度")
++
++    def _goal_response(self, future, sequence):
++        if self.pending_goal_future is future:
++            self.pending_goal_future = None
++            self.pending_goal_sequence = None
++        try:
++            goal = future.result()
++        except Exception as error:
++            self._publish_status(f"目标 {sequence} 发送失败：{error}")
++            self._finish_goal_locally(sequence, "failed")
++            return
++        if not goal.accepted:
++            self._publish_status(f"目标 {sequence} 被 Nav2 拒绝")
++            self._finish_goal_locally(sequence, "rejected")
++            return
++        if sequence in self.terminal_goal_sequences:
++            # stop_navigation may have completed locally while send_goal_async
++            # was still pending. Cancel the late-accepted handle immediately.
++            self._start_zero_guard()
++            self._request_goal_handle_cancel(goal, sequence)
++            goal.get_result_async().add_done_callback(
++                lambda result, target=goal, target_sequence=sequence:
++                self._navigation_result(result, target, target_sequence)
++            )
+             return
++        self.active_goal = goal
++        self.active_goal_sequence = sequence
+         self._set_navigation_active(True)
+-        self._publish_status("Nav2 已接受目标，正在导航")
+-        self.active_goal.get_result_async().add_done_callback(self._navigation_result)
++        if sequence in self.cancel_requested_sequences:
++            self._set_goal_state(sequence, "cancel_requested", None)
++            self._request_goal_handle_cancel(goal, sequence)
++        else:
++            self._set_goal_state(sequence, "active", None)
++            self._publish_status(f"目标 {sequence} 已被 Nav2 接受，正在导航")
++        goal.get_result_async().add_done_callback(
++            lambda result, target=goal, target_sequence=sequence:
++            self._navigation_result(result, target, target_sequence)
++        )
++
++    def _finish_goal_locally(self, sequence, state, result_status=None):
++        self.terminal_goal_sequences.add(sequence)
++        # Bound tombstones while still covering all realistically late futures.
++        if len(self.terminal_goal_sequences) > 64:
++            self.terminal_goal_sequences = set(sorted(self.terminal_goal_sequences)[-32:])
++        self.zero_guard_sequences.discard(sequence)
++        self.cancel_requested_sequences.discard(sequence)
++        if self.pending_goal_sequence == sequence:
++            self.pending_goal_future = None
++            self.pending_goal_sequence = None
++        if self.active_goal_sequence == sequence:
++            self.active_goal = None
++            self.active_goal_sequence = None
++            self.cancel_pending_goal = None
++        if self.goal_state.get("sequence") == sequence:
++            self._set_goal_state(sequence, state, result_status)
++        self._set_navigation_active(False)
+ 
+     def _stop_navigation_stack(self):
+         """Stop a Nav2 launch started by the App, or the manual n3/n4 launch."""
++        sequence = self._current_goal_sequence()
+         process = self.navigation_process
+         if self._is_process_running(process):
+             try:
+@@ -304,9 +493,14 @@ class RobotAppApi(Node):
+         self.navigation_algorithm = None
+         self.navigation_started_at = None
+         self.navigation_initial_pose_at = None
++        self.last_amcl_pose_at = None
++        self.last_local_costmap_at = None
++        self.last_global_costmap_at = None
+         self.navigation_timeout_reported = False
+-        self.active_goal = None
+-        self._set_navigation_active(False)
++        if sequence is not None:
++            self._finish_goal_locally(sequence, "stopped")
++        else:
++            self._set_navigation_active(False)
+         self._set_navigation_ready(False)
+ 
+     @staticmethod
+@@ -337,15 +531,31 @@ class RobotAppApi(Node):
+         remaining = feedback.feedback.distance_remaining
+         self._publish_status(f"导航中，剩余距离 {remaining:.2f} m")
+ 
+-    def _navigation_result(self, future):
++    def _navigation_result(self, future, goal, sequence):
+         try:
+             result = future.result()
+-            self._publish_status(f"导航结束，状态码 {result.status}")
++            status = int(result.status)
++            state = {
++                4: "succeeded",
++                5: "canceled",
++                6: "aborted",
++            }.get(status, "finished")
++            state_text = {
++                "succeeded": "已完成",
++                "canceled": "已取消",
++                "aborted": "执行失败",
++                "finished": "已结束",
++            }[state]
++            self._publish_status(f"目标 {sequence} {state_text}，状态码 {status}")
++            if sequence not in self.terminal_goal_sequences:
++                self._finish_goal_locally(sequence, state, status)
+         except Exception as error:
+-            self._publish_status(f"导航结果读取失败：{error}")
++            self._publish_status(f"目标 {sequence} 结果读取失败：{error}")
++            if sequence not in self.terminal_goal_sequences:
++                self._finish_goal_locally(sequence, "failed")
+         finally:
+-            self.active_goal = None
+-            self._set_navigation_active(False)
++            if self.cancel_pending_goal is goal:
++                self.cancel_pending_goal = None
+ 
+     def _start_launch(self, launch_file):
+         try:
+@@ -487,9 +697,24 @@ class RobotAppApi(Node):
+     def _on_odom(self, message):
+         self.last_odom_at = time.monotonic()
+ 
++    def _on_tf(self, message):
++        for transform in message.transforms:
++            parent = transform.header.frame_id.lstrip("/").lower()
++            child = transform.child_frame_id.lstrip("/").lower()
++            if parent == "odom" and child in {"base_footprint", "base_link"}:
++                self.last_odom_to_base_at = time.monotonic()
++                return
++
+     def _on_initial_pose(self, message):
+         if self.runtime["mode"] == "navigation":
+             self.navigation_initial_pose_at = time.monotonic()
++            self.last_amcl_pose_at = None
++            self.last_local_costmap_at = None
++            self.last_global_costmap_at = None
++
++    def _on_amcl_pose(self, message):
++        if self.runtime["mode"] == "navigation" and self.navigation_initial_pose_at is not None:
++            self.last_amcl_pose_at = time.monotonic()
+ 
+     def _on_map(self, message):
+         self.last_map_at = time.monotonic()
+@@ -507,6 +732,22 @@ class RobotAppApi(Node):
+             if {parent, child} == {"base_link", "laser"}:
+                 self.has_base_to_laser_tf = True
+ 
++    def _reset_base_health(self):
++        """Forget old n1 evidence and re-read the latched static transform."""
++        self.last_odom_at = None
++        self.last_scan_at = None
++        self.last_odom_to_base_at = None
++        self.has_base_to_laser_tf = False
++        subscription = getattr(self, "tf_static_subscription", None)
++        if subscription is not None:
++            self.destroy_subscription(subscription)
++        self.tf_static_subscription = self.create_subscription(
++            TFMessage,
++            "/tf_static",
++            self._on_tf_static,
++            self.state_qos,
++        )
++
+     @staticmethod
+     def _is_fresh(received_at, max_age):
+         return received_at is not None and time.monotonic() - received_at <= max_age
+@@ -515,6 +756,7 @@ class RobotAppApi(Node):
+         return (
+             self._is_fresh(self.last_odom_at, self.SENSOR_STALE_SECONDS)
+             and self._is_fresh(self.last_scan_at, self.SENSOR_STALE_SECONDS)
++            and self._is_fresh(self.last_odom_to_base_at, self.SENSOR_STALE_SECONDS)
+             and self.has_base_to_laser_tf
+         )
+ 
+@@ -524,11 +766,27 @@ class RobotAppApi(Node):
+         except AttributeError:
+             return self.navigate_action.wait_for_server(timeout_sec=0.0)
+ 
++    def _initial_pose_is_accepted(self):
++        return (
++            self.navigation_initial_pose_at is not None
++            and self.last_amcl_pose_at is not None
++            and self.last_amcl_pose_at >= self.navigation_initial_pose_at
++        )
++
++    def _costmap_is_current(self, received_at):
++        return (
++            self._initial_pose_is_accepted()
++            and self._is_fresh(received_at, self.COSTMAP_STALE_SECONDS)
++            and received_at >= self.last_amcl_pose_at
++        )
++
+     def _navigation_stack_is_ready(self):
+         return (
+             all(self._node_exists(node) for node in self.NAVIGATION_NODES)
+-            and self._is_fresh(self.last_local_costmap_at, self.COSTMAP_STALE_SECONDS)
+-            and self._is_fresh(self.last_global_costmap_at, self.COSTMAP_STALE_SECONDS)
++            and self._initial_pose_localizer_is_ready()
++            and self._initial_pose_is_accepted()
++            and self._costmap_is_current(self.last_local_costmap_at)
++            and self._costmap_is_current(self.last_global_costmap_at)
+             and self._action_server_is_ready()
+         )
+ 
+@@ -627,6 +885,11 @@ class RobotAppApi(Node):
+                 return
+             self._set_runtime("navigation_base", "waiting_scan", False, "n1 已启动，等待 /scan 数据")
+             return
++        if not self._is_fresh(self.last_odom_to_base_at, self.SENSOR_STALE_SECONDS):
++            if self._mark_startup_timeout("navigation_base", self.navigation_base_started_at, "laser_bringup_launch.py"):
++                return
++            self._set_runtime("navigation_base", "waiting_tf", False, "n1 已启动，等待新鲜 odom→base_footprint TF")
++            return
+         if not self.has_base_to_laser_tf:
+             if self._mark_startup_timeout("navigation_base", self.navigation_base_started_at, "laser_bringup_launch.py"):
+                 return
+@@ -666,7 +929,16 @@ class RobotAppApi(Node):
+             self._set_navigation_ready(False)
+             self._set_runtime("navigation", "waiting_nodes", False, "等待 Nav2 节点：" + ", ".join(missing))
+             return
+-        if self.count_subscribers("/initialpose") == 0:
++        if not self._base_is_ready():
++            self._set_navigation_ready(False)
++            self._set_runtime(
++                "navigation",
++                "waiting_base",
++                False,
++                "导航基础数据失效，等待 /odom、/scan、动态 TF 与雷达静态 TF",
++            )
++            return
++        if not self._initial_pose_localizer_is_ready():
+             if self._mark_startup_timeout(
+                 "navigation", self.navigation_started_at, self.navigation_launch_file or "navigation_dwa_launch.py"
+             ):
+@@ -678,7 +950,24 @@ class RobotAppApi(Node):
+             self._set_navigation_ready(False)
+             self._set_runtime("navigation", "awaiting_initial_pose", False, "Nav2 核心节点已启动，请在地图上设置并发布初始位姿")
+             return
+-        if not self._is_fresh(self.last_local_costmap_at, self.COSTMAP_STALE_SECONDS):
++        if not self._initial_pose_is_accepted():
++            self._set_navigation_ready(False)
++            if self._startup_timed_out(self.navigation_initial_pose_at):
++                self._set_runtime(
++                    "navigation",
++                    "waiting_amcl_pose",
++                    False,
++                    "AMCL 未接受初始位姿，请在地图上确认位置并重新发布",
++                )
++            else:
++                self._set_runtime(
++                    "navigation",
++                    "waiting_amcl_pose",
++                    False,
++                    "初始位姿已发送，等待 AMCL 输出 /amcl_pose",
++                )
++            return
++        if not self._costmap_is_current(self.last_local_costmap_at):
+             if self._mark_startup_timeout(
+                 "navigation", self.navigation_initial_pose_at, self.navigation_launch_file or "navigation_dwa_launch.py"
+             ):
+@@ -686,7 +975,7 @@ class RobotAppApi(Node):
+             self._set_navigation_ready(False)
+             self._set_runtime("navigation", "waiting_local_costmap", False, "等待局部代价地图")
+             return
+-        if not self._is_fresh(self.last_global_costmap_at, self.COSTMAP_STALE_SECONDS):
++        if not self._costmap_is_current(self.last_global_costmap_at):
+             if self._mark_startup_timeout(
+                 "navigation", self.navigation_initial_pose_at, self.navigation_launch_file or "navigation_dwa_launch.py"
+             ):
+@@ -727,28 +1016,6 @@ class RobotAppApi(Node):
+             self._set_mapping_active(False)
+             self._set_navigation_ready(False)
+ 
+-    def _legacy_refresh_runtime_state(self):
+-        self._set_mapping_active(self._node_exists("slam_gmapping"))
+-        ready = self._node_exists("bt_navigator")
+-        self._set_navigation_ready(ready)
+-        if ready or self.navigation_process is None:
+-            return
+-        exit_code = self.navigation_process.poll()
+-        log_path = self._launch_log_path(self.navigation_launch_file or "navigation_dwa_launch.py")
+-        if exit_code is not None:
+-            self.navigation_process = None
+-            self.navigation_launch_file = None
+-            self.navigation_started_at = None
+-            self._publish_status(f"Nav2 启动进程已退出（代码 {exit_code}）；请查看 {log_path}")
+-            return
+-        if (
+-            self.navigation_started_at is not None
+-            and not self.navigation_timeout_reported
+-            and time.monotonic() - self.navigation_started_at >= 45.0
+-        ):
+-            self.navigation_timeout_reported = True
+-            self._publish_status(f"Nav2 超过 45 秒未就绪；请查看 {log_path}")
+-
+     def _set_navigation_ready(self, ready):
+         if self.navigation_ready == ready:
+             return
+@@ -772,6 +1039,20 @@ class RobotAppApi(Node):
+     def _is_process_running(self, process):
+         return process is not None and process.poll() is None
+ 
++    def _initial_pose_localizer_is_ready(self):
++        """Return true only for an AMCL subscriber, never this supervisor."""
++        if not self._node_exists("amcl"):
++            return False
++        try:
++            endpoints = self.get_subscriptions_info_by_topic("/initialpose")
++        except (AttributeError, NotImplementedError, RuntimeError):
++            return self.count_subscribers("/initialpose") > 1
++        for endpoint in endpoints:
++            node_name = getattr(endpoint, "node_name", "").lstrip("/")
++            if node_name == "amcl" or node_name.endswith("/amcl"):
++                return True
++        return False
++
+     def _node_exists(self, expected_name):
+         return any(name == expected_name for name, _ in self.get_node_names_and_namespaces())
+ 
+
