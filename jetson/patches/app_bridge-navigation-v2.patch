@@ -1,0 +1,273 @@
+diff --git a/app_bridge.py b/app_bridge.py
+index 443aabf..383ed24 100644
+--- a/app_bridge.py
++++ b/app_bridge.py
+@@ -105,6 +105,16 @@ class AppBridge(Node):
+             "navigation_ready": False,
+             "navigation_active": False,
+             "navigation_status": "未启动",
++            "navigation_goal": {
++                "sequence": 0,
++                "state": "idle",
++                "result_status": None,
++            },
++            "navigation_goal_sequence": 0,
++            "navigation_goal_state": "idle",
++            "navigation_result_status": None,
++            "local_overlay_frame": "unknown",
++            "local_plan_frame": "waiting_transform",
+             "runtime": self.bridge_runtime,
+         }
+ 
+@@ -125,6 +135,7 @@ class AppBridge(Node):
+         self.create_subscription(Bool, "/app/navigation_ready", self.on_navigation_ready, map_qos)
+         self.create_subscription(Bool, "/app/navigation_active", self.on_navigation_active, map_qos)
+         self.create_subscription(String, "/app/navigation_status", self.on_navigation_status, map_qos)
++        self.create_subscription(String, "/app/navigation_goal_state", self.on_navigation_goal_state, map_qos)
+         self.create_subscription(String, "/app/runtime_state", self.on_runtime_state, map_qos)
+ 
+         self.cmd_vel = self.create_publisher(Twist, "/cmd_vel", 10)
+@@ -142,14 +153,41 @@ class AppBridge(Node):
+     def enqueue(self, client, message):
+         self.commands.put((client, message))
+ 
++    def enqueue_safety_stop(self, reason):
++        """Request a zero Twist from the ROS executor thread."""
++        self.commands.put((None, {"command": "_safety_stop", "reason": reason}))
++
+     def drain_commands(self):
+         while True:
+             try:
+                 client, message = self.commands.get_nowait()
+             except queue.Empty:
+                 return
++            if client is None and message.get("command") == "_safety_stop":
++                self.cmd_vel.publish(Twist())
++                self.get_logger().warning(f"Safety stop: {message.get('reason', 'unspecified')}")
++                service = self.bridge_services["emergency_stop"]
++                if service.service_is_ready():
++                    future = service.call_async(Trigger.Request())
++                    future.add_done_callback(self.on_disconnect_emergency_response)
++                else:
++                    self.get_logger().error(
++                        "Disconnect safety stop published zero, but /app/emergency_stop is not ready"
++                    )
++                continue
+             self.handle_command(client, message)
+ 
++    def on_disconnect_emergency_response(self, future):
++        try:
++            response = future.result()
++        except Exception as error:
++            self.get_logger().error(f"Disconnect emergency_stop call failed: {error}")
++            return
++        if response.success:
++            self.get_logger().warning("Disconnect emergency_stop service accepted")
++        else:
++            self.get_logger().error(f"Disconnect emergency_stop rejected: {response.message}")
++
+     def handle_command(self, client, message):
+         request_id = message.get("id", "")
+         command = message.get("command", "")
+@@ -195,7 +233,9 @@ class AppBridge(Node):
+     def publish_initial_pose(self, message):
+         pose = PoseWithCovarianceStamped()
+         pose.header.frame_id = "map"
+-        pose.header.stamp = self.get_clock().now().to_msg()
++        # A zero stamp asks AMCL/tf2 for the latest available transform. Using
++        # Jetson "now" raced odom by a few milliseconds on the real vehicle
++        # and intermittently caused "extrapolation into the future".
+         pose.pose.pose.position.x = float(message["x"])
+         pose.pose.pose.position.y = float(message["y"])
+         self.set_yaw(pose.pose.pose.orientation, float(message.get("yaw", 0.0)))
+@@ -228,6 +268,10 @@ class AppBridge(Node):
+         )
+ 
+     def on_local_costmap(self, message):
++        if self.bridge_runtime.get("mode") != "navigation":
++            return
++        frame = self.normalize_frame(message.header.frame_id) or "unknown"
++        self.broadcast_state_if_changed(local_overlay_frame=frame)
+         self.last_local_costmap_sent = self.publish_grid_if_due(
+             message,
+             PACKET_LOCAL_COSTMAP,
+@@ -236,6 +280,8 @@ class AppBridge(Node):
+         )
+ 
+     def on_global_costmap(self, message):
++        if self.bridge_runtime.get("mode") != "navigation":
++            return
+         self.last_global_costmap_sent = self.publish_grid_if_due(
+             message,
+             PACKET_GLOBAL_COSTMAP,
+@@ -253,7 +299,7 @@ class AppBridge(Node):
+         header = struct.pack(
+             "!4sBIIfffII",
+             MAGIC,
+-            PACKET_MAP,
++            packet_type,
+             message.info.width,
+             message.info.height,
+             message.info.resolution,
+@@ -271,6 +317,8 @@ class AppBridge(Node):
+         return now
+ 
+     def on_global_plan(self, message):
++        if self.bridge_runtime.get("mode") != "navigation":
++            return
+         self.last_global_plan_sent = self.publish_path_if_due(
+             message,
+             PACKET_GLOBAL_PLAN,
+@@ -278,13 +326,27 @@ class AppBridge(Node):
+         )
+ 
+     def on_local_plan(self, message):
++        if self.bridge_runtime.get("mode") != "navigation":
++            return
++        frame = self.normalize_frame(message.header.frame_id)
++        transform = None
++        if frame == "odom":
++            if self.map_to_odom is None:
++                self.broadcast_state_if_changed(local_plan_frame="waiting_transform")
++                return
++            transform = self.map_to_odom
++        elif frame != "map":
++            self.broadcast_state_if_changed(local_plan_frame=frame or "unknown")
++            return
++        self.broadcast_state_if_changed(local_plan_frame="map")
+         self.last_local_plan_sent = self.publish_path_if_due(
+             message,
+             PACKET_LOCAL_PLAN,
+             self.last_local_plan_sent,
++            transform=transform,
+         )
+ 
+-    def publish_path_if_due(self, message, packet_type, last_sent):
++    def publish_path_if_due(self, message, packet_type, last_sent, transform=None):
+         now = time.monotonic()
+         if now - last_sent < PATH_INTERVAL_SECONDS:
+             return last_sent
+@@ -294,11 +356,21 @@ class AppBridge(Node):
+         packet = bytearray(struct.pack("!4sBH", MAGIC, packet_type, len(samples)))
+         for pose in samples:
+             position = pose.pose.position
++            x = position.x
++            y = position.y
++            yaw = self.quaternion_yaw(pose.pose.orientation)
++            if transform is not None:
++                map_x, map_y, map_yaw = transform
++                x, y, yaw = (
++                    map_x + math.cos(map_yaw) * x - math.sin(map_yaw) * y,
++                    map_y + math.sin(map_yaw) * x + math.cos(map_yaw) * y,
++                    map_yaw + yaw,
++                )
+             packet.extend(struct.pack(
+                 "!fff",
+-                position.x,
+-                position.y,
+-                self.quaternion_yaw(pose.pose.orientation),
++                x,
++                y,
++                yaw,
+             ))
+         encoded = bytes(packet)
+         self.last_navigation_packets[packet_type] = encoded
+@@ -381,6 +453,28 @@ class AppBridge(Node):
+     def on_navigation_status(self, message):
+         self.broadcast_state(navigation_status=message.data)
+ 
++    def on_navigation_goal_state(self, message):
++        try:
++            goal = json.loads(message.data)
++            sequence = int(goal["sequence"])
++            state = str(goal["state"])
++            result_status = goal.get("result_status")
++            if result_status is not None:
++                result_status = int(result_status)
++        except (KeyError, TypeError, ValueError) as error:
++            self.get_logger().warning(f"Ignoring invalid /app/navigation_goal_state: {error}")
++            return
++        self.broadcast_state(
++            navigation_goal={
++                "sequence": sequence,
++                "state": state,
++                "result_status": result_status,
++            },
++            navigation_goal_sequence=sequence,
++            navigation_goal_state=state,
++            navigation_result_status=result_status,
++        )
++
+     def on_runtime_state(self, message):
+         try:
+             runtime = json.loads(message.data)
+@@ -390,14 +484,37 @@ class AppBridge(Node):
+         if not isinstance(runtime, dict):
+             self.get_logger().warning("Ignoring /app/runtime_state that is not an object")
+             return
++        next_mode = runtime.get("mode")
++        next_phase = runtime.get("phase")
++        if next_mode != "navigation" or next_phase == "starting":
++            self.reset_navigation_overlays()
+         self.bridge_runtime = runtime
+         self.state["runtime"] = runtime
+         self.broadcast_text({"op": "runtime", **runtime})
+ 
++    def reset_navigation_overlays(self):
++        """Drop cached type 4-7 packets when a navigation session changes."""
++        self.last_navigation_packets.clear()
++        self.last_local_costmap_sent = 0.0
++        self.last_global_costmap_sent = 0.0
++        self.last_global_plan_sent = 0.0
++        self.last_local_plan_sent = 0.0
++        self.map_to_odom = None
++        self.robot_pose = None
++        self.broadcast_state_if_changed(
++            local_overlay_frame="unknown",
++            local_plan_frame="waiting_transform",
++        )
++
+     def broadcast_state(self, **values):
+         self.state.update(values)
+         self.broadcast_text({"op": "state", **values})
+ 
++    def broadcast_state_if_changed(self, **values):
++        changed = {key: value for key, value in values.items() if self.state.get(key) != value}
++        if changed:
++            self.broadcast_state(**changed)
++
+     def reply(self, client, request_id, ok, message):
+         self.send_text(client, {"op": "response", "id": request_id, "ok": ok, "message": message})
+ 
+@@ -436,14 +553,14 @@ async def websocket_server(node, host, port):
+     # releases only pass websocket. The optional path supports both APIs.
+     async def handler(websocket, path=None):
+         node.bridge_clients.add(websocket)
+-        node.send_text(websocket, {"op": "hello", "protocol": 1})
+-        await websocket.send(json.dumps({"op": "state", **node.state}, ensure_ascii=False, separators=(",", ":")))
+-        await websocket.send(json.dumps({"op": "runtime", **node.bridge_runtime}, ensure_ascii=False, separators=(",", ":")))
+-        if node.last_map_packet is not None:
+-            await websocket.send(node.last_map_packet)
+-        for packet in node.last_navigation_packets.values():
+-            await websocket.send(packet)
+         try:
++            node.send_text(websocket, {"op": "hello", "protocol": 1})
++            await websocket.send(json.dumps({"op": "state", **node.state}, ensure_ascii=False, separators=(",", ":")))
++            await websocket.send(json.dumps({"op": "runtime", **node.bridge_runtime}, ensure_ascii=False, separators=(",", ":")))
++            if node.last_map_packet is not None:
++                await websocket.send(node.last_map_packet)
++            for packet in node.last_navigation_packets.values():
++                await websocket.send(packet)
+             async for payload in websocket:
+                 if isinstance(payload, bytes):
+                     continue
+@@ -453,6 +570,8 @@ async def websocket_server(node, host, port):
+                     node.reply(websocket, "", False, "控制消息必须是 JSON 文本")
+         finally:
+             node.bridge_clients.discard(websocket)
++            if not node.bridge_clients:
++                node.enqueue_safety_stop("last WebSocket client disconnected")
+ 
+     async with websockets.serve(
+         handler,
+

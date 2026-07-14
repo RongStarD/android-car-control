@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Jetson 与 Android 位于同一教学局域网，控制桥目前使用 ws/http。 -->
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>
