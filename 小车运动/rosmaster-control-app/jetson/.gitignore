@@ -1,0 +1,8 @@
+.venv/
+.deps/
+.install-complete
+run/
+__pycache__/
+*.py[cod]
+rosmaster_bridge/__pycache__/
+tests/__pycache__/

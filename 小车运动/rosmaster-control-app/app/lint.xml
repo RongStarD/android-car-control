@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<lint>
+    <!-- 本项目按需求仅用于竖屏实车遥控。 -->
+    <issue id="DiscouragedApi" severity="ignore" />
+    <issue id="LockedOrientationActivity" severity="ignore" />
+    <!-- Jetson 教学局域网桥使用动态 IP，当前只提供 ws/http。 -->
+    <issue id="InsecureBaseConfiguration" severity="ignore" />
+</lint>
