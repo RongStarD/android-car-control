@@ -1,0 +1,622 @@
+package cn.edu.xxq.faceenrollment
+
+import android.content.Context
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.os.Bundle
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.lightColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.viewmodel.compose.viewModel
+import cn.edu.xxq.faceenrollment.data.MAX_FACE_IMAGES
+import cn.edu.xxq.faceenrollment.data.MAX_FACE_TOTAL_BYTES
+import cn.edu.xxq.faceenrollment.data.ServiceStatus
+import cn.edu.xxq.faceenrollment.media.FaceImageSample
+import java.io.File
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
+
+private val AppBlue = Color(0xFF1769C2)
+private val AppBlueDark = Color(0xFF0D4E99)
+private val AppGreen = Color(0xFF16835B)
+private val AppOrange = Color(0xFFD97706)
+private val AppRed = Color(0xFFC62828)
+private val AppColors = lightColorScheme(
+    primary = AppBlue,
+    onPrimary = Color.White,
+    primaryContainer = Color(0xFFD8E9FF),
+    onPrimaryContainer = Color(0xFF001C3B),
+    secondary = Color(0xFF46617F),
+    background = Color(0xFFF4F7FC),
+    surface = Color.White,
+    error = AppRed,
+)
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        cleanupStaleCaptureFiles(this)
+        enableEdgeToEdge()
+        setContent {
+            MaterialTheme(colorScheme = AppColors) {
+                FaceEnrollmentScreen()
+            }
+        }
+    }
+}
+
+@Composable
+private fun FaceEnrollmentScreen(viewModel: FaceEnrollmentViewModel = viewModel()) {
+    val state by viewModel.state.collectAsStateWithLifecycle()
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var pendingCameraUri by rememberSaveable { mutableStateOf<String?>(null) }
+    var pendingCameraPath by rememberSaveable { mutableStateOf<String?>(null) }
+
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            when (event) {
+                Lifecycle.Event.ON_START -> viewModel.setPollingEnabled(true)
+                Lifecycle.Event.ON_STOP -> viewModel.setPollingEnabled(false)
+                else -> Unit
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        if (lifecycleOwner.lifecycle.currentState.isAtLeast(Lifecycle.State.STARTED)) {
+            viewModel.setPollingEnabled(true)
+        }
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.setPollingEnabled(false)
+        }
+    }
+
+    val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { saved ->
+        val uri = pendingCameraUri?.let(Uri::parse)
+        val path = pendingCameraPath
+        pendingCameraUri = null
+        pendingCameraPath = null
+        if (saved && uri != null) {
+            viewModel.addImages(listOf(uri), "相机") { deleteCaptureFile(path) }
+        } else {
+            deleteCaptureFile(path)
+            viewModel.reportActionError("拍照已取消")
+        }
+    }
+    val galleryLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.PickMultipleVisualMedia(MAX_FACE_IMAGES),
+    ) { uris ->
+        if (uris.isNotEmpty()) viewModel.addImages(uris, "相册")
+    }
+
+    Scaffold(containerColor = MaterialTheme.colorScheme.background) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(innerPadding)
+                .imePadding()
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Header(state)
+            state.notice?.let { MessageBanner(it, isError = false, viewModel::clearMessages) }
+            state.actionError?.let { MessageBanner(it, isError = true, viewModel::clearMessages) }
+            ServiceCard(state, viewModel)
+            StatusCard(state, viewModel)
+            EnrollmentCard(
+                state = state,
+                viewModel = viewModel,
+                onTakePhoto = {
+                    var target: CameraCaptureTarget? = null
+                    try {
+                        target = createCameraTarget(context)
+                        pendingCameraUri = target.uri.toString()
+                        pendingCameraPath = target.file.absolutePath
+                        cameraLauncher.launch(target.uri)
+                    } catch (error: Exception) {
+                        deleteCaptureFile(target?.file?.absolutePath)
+                        pendingCameraUri = null
+                        pendingCameraPath = null
+                        viewModel.reportActionError("无法启动系统相机：${error.message ?: "设备不可用"}")
+                    }
+                },
+                onPickPhotos = {
+                    galleryLauncher.launch(
+                        PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                    )
+                },
+            )
+            Spacer(Modifier.height(12.dp))
+        }
+    }
+}
+
+@Composable
+private fun Header(state: FaceEnrollmentUiState) {
+    val (badge, badgeColor) = when {
+        state.statusLoading && state.serviceStatus == null -> "连接中" to AppOrange
+        state.statusError != null -> "连接异常" to AppRed
+        state.serviceStatus != null -> "服务在线" to AppGreen
+        else -> "未连接" to Color(0xFF6A7584)
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text("用户人脸采集", fontSize = 26.sp, fontWeight = FontWeight.Bold, color = Color(0xFF172033))
+            Text("手机采集 · Jetson 录入 · 小车识别", color = Color(0xFF53657A))
+        }
+        StatusBadge(badge, badgeColor)
+    }
+}
+
+@Composable
+private fun ServiceCard(state: FaceEnrollmentUiState, viewModel: FaceEnrollmentViewModel) {
+    val busy = state.uploading
+    SectionCard("服务连接") {
+        OutlinedTextField(
+            value = state.serviceUrl,
+            onValueChange = viewModel::setServiceUrl,
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("人脸服务地址") },
+            placeholder = { Text("http://10.39.132.165:9095") },
+            singleLine = true,
+            enabled = !busy,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Button(
+                onClick = viewModel::refreshStatus,
+                enabled = !state.statusLoading && !busy,
+            ) { Text("刷新服务") }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("每 5 秒刷新", style = MaterialTheme.typography.bodySmall)
+                Spacer(Modifier.width(8.dp))
+                Switch(checked = state.autoRefresh, onCheckedChange = viewModel::setAutoRefresh)
+            }
+        }
+        Text(
+            "服务凭据已内置；App 仅连接同一局域网中的人脸服务，照片不会保存在本 App 的相册中。",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFF64748B),
+        )
+    }
+}
+
+@Composable
+private fun StatusCard(state: FaceEnrollmentUiState, viewModel: FaceEnrollmentViewModel) {
+    SectionCard("小车识别状态") {
+        if (state.statusLoading) LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        state.statusError?.let { ErrorText(it) }
+        val status = state.serviceStatus
+        if (status == null) {
+            Text(
+                "尚未取得服务状态，请确认手机和小车在同一网络。",
+                color = Color(0xFF64748B),
+            )
+        } else {
+            StatusSummary(status)
+            status.camera.source?.let { Text("摄像头来源：$it", style = MaterialTheme.typography.bodySmall) }
+            status.camera.error?.let { ErrorText("摄像头：$it") }
+            RecognitionStatusBlock(status)
+            HorizontalDivider(color = Color(0xFFE3EAF2))
+            LatestRecognitionBlock(status)
+            state.statusUpdatedAt?.let { timestamp ->
+                val time = remember(timestamp) {
+                    DateFormat.getTimeInstance(DateFormat.MEDIUM).format(Date(timestamp))
+                }
+                Text("状态更新时间：$time", style = MaterialTheme.typography.labelSmall, color = Color(0xFF718096))
+            }
+        }
+        OutlinedButton(
+            onClick = viewModel::refreshStatus,
+            enabled = !state.statusLoading,
+        ) {
+            Text("立即刷新识别结果")
+        }
+    }
+}
+
+@Composable
+private fun RecognitionStatusBlock(status: ServiceStatus) {
+    val recognition = status.recognition
+    val (label, color) = when {
+        recognition.error != null -> "推理故障" to AppRed
+        !recognition.enabled -> "未启用" to Color(0xFF6A7584)
+        recognition.ready -> "推理就绪" to AppGreen
+        else -> "尚未就绪" to AppOrange
+    }
+    Surface(color = color.copy(alpha = 0.09f), shape = RoundedCornerShape(12.dp)) {
+        Column(modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 9.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("人脸识别引擎", fontWeight = FontWeight.SemiBold)
+                Text(label, color = color, fontWeight = FontWeight.Bold)
+            }
+            recognition.error?.let { ErrorText("推理服务：$it") }
+            recognition.lastSuccessAt?.let {
+                Text("最近成功推理：$it", style = MaterialTheme.typography.labelSmall, color = Color(0xFF64748B))
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusSummary(status: ServiceStatus) {
+    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        StatusTile(
+            modifier = Modifier.weight(1f),
+            title = "小车摄像头",
+            value = if (status.camera.ready) "已就绪" else "未就绪",
+            color = if (status.camera.ready) AppGreen else AppOrange,
+        )
+        StatusTile(
+            modifier = Modifier.weight(1f),
+            title = "已录入人员",
+            value = status.database.people.toString(),
+            color = AppBlue,
+        )
+        StatusTile(
+            modifier = Modifier.weight(1f),
+            title = "人脸样本",
+            value = status.database.samples.toString(),
+            color = AppBlueDark,
+        )
+    }
+}
+
+@Composable
+private fun LatestRecognitionBlock(status: ServiceStatus) {
+    val latest = status.latest
+    Text("最近识别", fontWeight = FontWeight.Bold, color = Color(0xFF25364A))
+    when {
+        latest == null -> Text("暂无识别记录", color = Color(0xFF64748B))
+        latest.faces.isEmpty() -> Text("最近画面未识别到已录入人员", color = Color(0xFF64748B))
+        else -> {
+            latest.faces.forEach { face ->
+                Surface(color = Color(0xFFEAF4FF), shape = RoundedCornerShape(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(face.name, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            "相似度 ${String.format(Locale.US, "%.3f", face.similarity)}",
+                            color = AppBlueDark,
+                        )
+                    }
+                }
+            }
+            latest.timestamp?.let {
+                Text("服务时间：$it", style = MaterialTheme.typography.labelSmall, color = Color(0xFF718096))
+            }
+        }
+    }
+}
+
+@Composable
+private fun EnrollmentCard(
+    state: FaceEnrollmentUiState,
+    viewModel: FaceEnrollmentViewModel,
+    onTakePhoto: () -> Unit,
+    onPickPhotos: () -> Unit,
+) {
+    val busy = state.processingImages || state.uploading
+    SectionCard("录入人员") {
+        OutlinedTextField(
+            value = state.personName,
+            onValueChange = viewModel::setPersonName,
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("人员姓名") },
+            supportingText = { Text("建议使用真实姓名或唯一编号，最多 64 个字符") },
+            singleLine = true,
+            enabled = !state.uploading,
+        )
+        Surface(color = Color(0xFFF0F5FB), shape = RoundedCornerShape(12.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("替换同名人员", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        if (state.replaceExisting) "上传成功后覆盖远端同名样本" else "同名人员将按服务端规则追加样本",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF64748B),
+                    )
+                }
+                Switch(
+                    checked = state.replaceExisting,
+                    onCheckedChange = viewModel::setReplaceExisting,
+                    enabled = !state.uploading,
+                )
+            }
+        }
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            Button(
+                onClick = onTakePhoto,
+                modifier = Modifier.weight(1f),
+                enabled = !busy && state.images.size < MAX_FACE_IMAGES,
+            ) { Text("系统相机拍照") }
+            OutlinedButton(
+                onClick = onPickPhotos,
+                modifier = Modifier.weight(1f),
+                enabled = !busy && state.images.size < MAX_FACE_IMAGES,
+            ) { Text("相册多选") }
+        }
+        if (state.processingImages) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(10.dp))
+                Text("正在纠正方向并压缩图片…")
+            }
+        }
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            val totalBytes = state.images.sumOf { it.sizeBytes.toLong() }
+            Text(
+                "待上传 ${state.images.size}/$MAX_FACE_IMAGES · ${formatBytes(totalBytes)}/20 MiB",
+                fontWeight = FontWeight.SemiBold,
+            )
+            TextButton(onClick = viewModel::clearImages, enabled = state.images.isNotEmpty() && !state.uploading) {
+                Text("清空")
+            }
+        }
+        if (state.images.isEmpty()) {
+            Surface(color = Color(0xFFF7F9FC), shape = RoundedCornerShape(12.dp)) {
+                Text(
+                    "请采集正脸、轻微左右角度和不同光照下的清晰照片，避免多人同框。",
+                    modifier = Modifier.fillMaxWidth().padding(14.dp),
+                    color = Color(0xFF64748B),
+                )
+            }
+        } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                state.images.forEachIndexed { index, sample ->
+                    key(sample.id) {
+                        SampleThumbnail(index, sample, !state.uploading) { viewModel.removeImage(sample.id) }
+                    }
+                }
+            }
+        }
+        Text(
+            "每张照片会在手机端纠正 EXIF 方向，缩放至最长边不超过 1600 px，并以 JPEG 质量 85 重编码；单张上限 5 MiB，全部样本合计上限 ${MAX_FACE_TOTAL_BYTES / (1024 * 1024)} MiB。",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFF64748B),
+        )
+        Button(
+            onClick = viewModel::upload,
+            modifier = Modifier.fillMaxWidth(),
+            enabled = !busy && state.images.isNotEmpty() && state.personName.isNotBlank(),
+            contentPadding = PaddingValues(vertical = 13.dp),
+        ) {
+            if (state.uploading) {
+                CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp, color = Color.White)
+                Spacer(Modifier.width(9.dp))
+                Text("正在上传…")
+            } else {
+                Text(if (state.replaceExisting) "上传并替换人员" else "上传并录入人员")
+            }
+        }
+    }
+}
+
+@Composable
+private fun SampleThumbnail(
+    index: Int,
+    sample: FaceImageSample,
+    removable: Boolean,
+    onRemove: () -> Unit,
+) {
+    val bitmap = remember(sample.id) {
+        BitmapFactory.decodeByteArray(sample.thumbnailJpeg, 0, sample.thumbnailJpeg.size)
+    }
+    Card(
+        modifier = Modifier.width(142.dp),
+        colors = CardDefaults.cardColors(containerColor = Color(0xFFF8FAFD)),
+        border = BorderStroke(1.dp, Color(0xFFDCE5EF)),
+    ) {
+        Column(modifier = Modifier.padding(8.dp), verticalArrangement = Arrangement.spacedBy(5.dp)) {
+            if (bitmap != null) {
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "第 ${index + 1} 张人脸样本",
+                    modifier = Modifier.fillMaxWidth().height(100.dp).clip(RoundedCornerShape(8.dp)),
+                    contentScale = ContentScale.Crop,
+                )
+            } else {
+                Box(
+                    modifier = Modifier.fillMaxWidth().height(100.dp).background(Color(0xFFE5EAF0)),
+                    contentAlignment = Alignment.Center,
+                ) { Text("预览失败") }
+            }
+            Text("${index + 1}. ${sample.sourceLabel}", fontWeight = FontWeight.SemiBold)
+            Text(
+                "${sample.width}×${sample.height} · ${formatBytes(sample.sizeBytes.toLong())}",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                color = Color(0xFF64748B),
+            )
+            TextButton(onClick = onRemove, enabled = removable, modifier = Modifier.fillMaxWidth()) {
+                Text("移除", color = if (removable) AppRed else Color.Gray)
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatusTile(modifier: Modifier, title: String, value: String, color: Color) {
+    Surface(modifier = modifier, color = color.copy(alpha = 0.09f), shape = RoundedCornerShape(12.dp)) {
+        Column(
+            modifier = Modifier.padding(horizontal = 7.dp, vertical = 10.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+            Spacer(Modifier.height(4.dp))
+            Text(title, style = MaterialTheme.typography.labelSmall, color = Color(0xFF526276), maxLines = 1)
+            Text(value, fontWeight = FontWeight.Bold, color = color)
+        }
+    }
+}
+
+@Composable
+private fun StatusBadge(label: String, color: Color) {
+    Surface(color = color.copy(alpha = 0.12f), contentColor = color, shape = RoundedCornerShape(50)) {
+        Text(
+            label,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
+            fontWeight = FontWeight.SemiBold,
+        )
+    }
+}
+
+@Composable
+private fun MessageBanner(message: String, isError: Boolean, onDismiss: () -> Unit) {
+    val color = if (isError) AppRed else AppGreen
+    Surface(color = color.copy(alpha = 0.1f), shape = RoundedCornerShape(12.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(start = 13.dp, end = 5.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(message, modifier = Modifier.weight(1f), color = color)
+            TextButton(onClick = onDismiss) { Text("关闭", color = color) }
+        }
+    }
+}
+
+@Composable
+private fun ErrorText(message: String) {
+    Text(message, color = AppRed, style = MaterialTheme.typography.bodySmall)
+}
+
+@Composable
+private fun SectionCard(title: String, content: @Composable ColumnScope.() -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Color.White),
+        border = BorderStroke(1.dp, Color(0xFFE0E7F0)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        shape = RoundedCornerShape(18.dp),
+    ) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(15.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Text(title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold, color = Color(0xFF1D2A3A))
+            content()
+        }
+    }
+}
+
+private data class CameraCaptureTarget(val uri: Uri, val file: File)
+
+private fun createCameraTarget(context: Context): CameraCaptureTarget {
+    val directory = File(context.cacheDir, "camera")
+    if (!directory.exists() && !directory.mkdirs()) error("无法创建相机缓存目录")
+    val file = File.createTempFile("face_capture_", ".jpg", directory)
+    val uri = FileProvider.getUriForFile(context, "${context.packageName}.files", file)
+    return CameraCaptureTarget(uri, file)
+}
+
+private fun deleteCaptureFile(path: String?) {
+    if (path.isNullOrBlank()) return
+    runCatching { File(path).delete() }
+}
+
+private fun cleanupStaleCaptureFiles(context: Context) {
+    val directory = File(context.cacheDir, "camera")
+    val staleBefore = System.currentTimeMillis() - 60 * 60 * 1_000L
+    directory.listFiles { file ->
+        file.isFile && file.name.startsWith("face_capture_") && file.name.endsWith(".jpg")
+    }?.filter { it.lastModified() <= 0L || it.lastModified() < staleBefore }
+        ?.forEach { runCatching { it.delete() } }
+}
+
+private fun formatBytes(bytes: Long): String = when {
+    bytes >= 1024 * 1024 -> String.format(Locale.US, "%.1f MiB", bytes / (1024f * 1024f))
+    else -> String.format(Locale.US, "%.0f KiB", bytes / 1024f)
+}
