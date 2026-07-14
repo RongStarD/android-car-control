@@ -1,0 +1,3 @@
+# Python 3.8 compatible. OpenCV is provided by the Jetson system image.
+websockets==10.4
+rsa==4.9
