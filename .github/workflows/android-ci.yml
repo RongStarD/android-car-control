@@ -1,0 +1,80 @@
+name: Final Apps CI
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "face-enrollment-app/**"
+      - "rosmaster-control-app/**"
+      - ".github/workflows/android-ci.yml"
+  pull_request:
+    paths:
+      - "face-enrollment-app/**"
+      - "rosmaster-control-app/**"
+      - ".github/workflows/android-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: final-apps-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.label }} — test, lint, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: face-enrollment-app
+            label: Face enrollment app
+            artifact: face-enrollment
+          - project: rosmaster-control-app
+            label: Rosmaster control app
+            artifact: rosmaster-control
+    env:
+      FACE_API_KEY: ci-validation-placeholder-not-for-production
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Run unit tests, lint, and debug build
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-debug-apk
+          path: ${{ matrix.project }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload reports on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-build-reports
+          path: ${{ matrix.project }}/app/build/reports/
+          if-no-files-found: ignore
+          retention-days: 7

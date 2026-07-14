@@ -1,0 +1,148 @@
+name: Final Apps CD
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v[0-9]*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: final-apps-cd-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Deliver ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - project: face-enrollment-app
+            label: Face enrollment app
+            artifact: face-enrollment
+          - project: rosmaster-control-app
+            label: Rosmaster control app
+            artifact: rosmaster-control
+    env:
+      FACE_API_KEY: ${{ secrets.FACE_API_KEY || 'cd-validation-placeholder-not-for-production' }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.project }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      - name: Validate signed-release secrets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          CONFIGURED_FACE_API_KEY: ${{ secrets.FACE_API_KEY }}
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          for name in CONFIGURED_FACE_API_KEY ANDROID_KEYSTORE_BASE64 ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD ANDROID_STORE_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "Missing required GitHub Actions secret: $name" >&2
+              exit 1
+            fi
+          done
+
+      - name: Build delivery-validation APK
+        if: github.event_name == 'workflow_dispatch'
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug --no-daemon --stacktrace
+
+      - name: Prepare delivery-validation APK
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}"
+          cp app/build/outputs/apk/debug/app-debug.apk \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}/${{ matrix.artifact }}-debug.apk"
+
+      - name: Restore release keystore
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.keystore"
+
+      - name: Build signed release APK
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          ./gradlew testDebugUnitTest lintRelease assembleRelease \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/release.keystore" \
+            -Pandroid.injected.signing.store.password="$ANDROID_STORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD" \
+            --no-daemon --stacktrace
+
+      - name: Prepare signed release APK
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}"
+          cp app/build/outputs/apk/release/app-release.apk \
+            "$GITHUB_WORKSPACE/dist/${{ matrix.artifact }}/${{ matrix.artifact }}-${GITHUB_REF_NAME}.apk"
+
+      - name: Upload app delivery artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: delivery-${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}/
+          if-no-files-found: error
+          retention-days: 30
+
+  package:
+    name: Package delivery bundle
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download app artifacts
+        uses: actions/download-artifact@v5
+        with:
+          pattern: delivery-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.apk > SHA256SUMS.txt
+
+      - name: Upload delivery bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-apps-delivery
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "$GITHUB_REF_NAME" dist/*
+          --verify-tag
+          --generate-notes
+          --title "$GITHUB_REF_NAME"
